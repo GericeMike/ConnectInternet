@@ -1,15 +1,15 @@
 //! rdlink 被控端：屏幕捕获 → NVENC 编码 → QUIC 发送；接收输入事件并注入。
 
+mod capture_demo;
+
 use ffmpeg_the_third as ffmpeg;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--check") => check(),
-        Some("--capture-demo") => {
-            eprintln!("capture-demo: 尚未实现（T3 交付：WGC 抓帧 demo）");
-            std::process::exit(2);
-        }
+        Some("--capture-demo") => capture_demo::run(),
+        Some("--list-monitors") => capture_demo::list_monitors(),
         Some("--encode-demo") => {
             eprintln!("encode-demo: 尚未实现（T4 交付：NVENC 编码落盘 demo）");
             std::process::exit(2);

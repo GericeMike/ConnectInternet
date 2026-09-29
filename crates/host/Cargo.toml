@@ -11,4 +11,5 @@ path = "src/main.rs"
 [dependencies]
 rdlink-proto = { path = "../proto" }
 ffmpeg-the-third = "6"
-# T3/T8 将加入: windows-capture, windows, rdlink-transport
+windows-capture = "2.0.1"
+# T8 将加入: windows, rdlink-transport
