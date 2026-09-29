@@ -1,70 +1,114 @@
 # rdlink
 
-Rust 编写的局域网远程桌面（自研，对标向日葵/UU 远程的低延迟体验）。
-Windows ↔ Windows，主控端 RTX 4060 laptop，被控端 MX250。
+Rust 编写的 Windows 局域网远程桌面。对标向日葵/UU 远程的低延迟体验，全链路自研：WGC 捕获 → 硬件编码 → QUIC 传输 → 解码 → wgpu 渲染，键鼠反向通道齐全。
 
-- 需求规格与任务拆解：见 `docs/M1-任务拆解.md`
-- 当前进度：**T0 完成**（工程骨架 + 全链路工具链验证）
+- 两机实测（4060 主控 ↔ MX250 被控，Wi-Fi）：**端到端 p50 18~22ms**、33~40fps、局域网免服务器
+- 设计文档：`docs/M1-任务拆解.md`（需求/架构/任务卡）、`docs/会话交接.md`（进度/坑位/决策）
+- 当前阶段：**M1 完成**（tag `m1`）
 
-## 项目结构
+## 快速上手（两台 Windows 机）
 
-```
-crates/
-├── proto/       # 线上协议消息（serde + bincode，两端共用）
-├── transport/   # QUIC 传输层（quinn + rustls，T2）
-├── host/        # 被控端 bin: host.exe（捕获/编码/输入注入）
-└── client/      # 主控端 bin: client.exe（解码/渲染/输入捕获）
-third_party/
-└── ffmpeg/      # vendored FFmpeg（git 忽略，按下述步骤获取）
-docs/            # 设计文档
-```
+### 被控端（一次性）
 
-## 环境搭建（两台机器相同步骤）
-
-1. **Rust**（stable-msvc）：https://rustup.rs 下载 rustup-init.exe，默认安装
-2. **VS Build Tools 2022**：勾选「使用 C++ 的桌面开发」（含 MSVC v143 + Windows 11 SDK）
-3. **LLVM**（bindgen 需要 libclang）：`winget install LLVM.LLVM`
-   - 默认装到 `C:\Program Files\LLVM\bin`，`.cargo/config.toml` 已指向该路径
-4. **FFmpeg vendored**（不入库，手动放置）：
+1. 环境搭建见下文「环境」一节
+2. 启动（**必须在桌面会话**，双击或 `start-host.bat`；WGC 捕获不能在 SSH/服务会话里跑）：
 
 ```
-# 下载后解压到 third_party/，最终结构：
-third_party/ffmpeg/bin/*.dll      # avcodec-62.dll 等
-third_party/ffmpeg/lib/*.lib
-third_party/ffmpeg/include/*
+cd 仓库根目录
+start-host.bat          # 后台启动，日志 host-run.log
 ```
 
-5. 验证：仓库根目录执行
+3. 启动输出里有**证书指纹**（64 位十六进制），填给主控端（指纹不变，只需查一次：`type host-run.log`）
+
+### 主控端
 
 ```
-cargo build --workspace
-PATH=third_party/ffmpeg/bin:$PATH cargo run -p rdlink-host -- --check
-# 期望输出：FFmpeg avutil: 60.x + h264_nvenc 可用 + libx264 可用
+cd 仓库根目录
+PATH=third_party/ffmpeg/bin:$PATH client.exe --host <被控端IP>:9527 <证书指纹>
 ```
 
-## 版本锁定（两台机必须一致）
+窗口模式打开（可最小化/关闭），**F11 全屏、Esc 退出**。标题栏实时显示：
 
-| 组件 | 版本 | 说明 |
-|------|------|------|
-| Rust | 1.98.1 stable-msvc | |
-| FFmpeg | BtbN n8.1-latest-win64-gpl-shared-8.1 | avutil 60 / avcodec 62，GPL 含 x264 |
-| ffmpeg-the-third | 6.0.0+ffmpeg-9.0 | crates.io，FFMPEG_DIR 自动探测版本 |
-| LLVM | 23.1.2 | 仅构建期需要 |
+```
+rdlink | 33fps | e2e 21ms(p95 27) | enc 15 dec 1 | rtt 2
+```
 
-## 已定决策记录
+### 辅助命令
 
-| # | 决策 | 理由 |
-|---|------|------|
-| D1 | M1 视频走 QUIC 可靠流 | 局域网零丢包无队头阻塞，M2 迁 datagram（trait 已预留） |
-| D2 | M1 允许两次显存拷贝 | 省 4~6ms 换实现速度，M2 做零拷贝 |
-| D3 | 渲染 vsync 默认关 | 延迟优先 |
-| D4 | 起播等待 IDR | 防花屏 |
-| D5 | 证书用 rcgen 运行时生成（替代 ps1 脚本） | 跨机一致、免 openssl，host 首启生成并落盘，client 配置 pin 指纹 |
-| D6 | FFMPEG_DIR 用 `[env] relative=true` | build script cwd 在 registry，纯相对路径会解析错位 |
-| D7 | 运行时 DLL 靠 PATH 或程序目录 | 调试期 `PATH=third_party/ffmpeg/bin`，发布期 build.rs 拷贝（M3） |
+| 命令 | 用途 |
+|------|------|
+| `host --check` | 编码器注册检查（注意：注册≠能开会话，以 `--encode-demo` 实测为准） |
+| `host --capture-demo` / `--encode-demo` | 捕获/编码自测（fps 统计 / out.h264 落盘） |
+| `host --input-demo` | 输入注入自测（6 项程序化验证） |
+| `host --list-monitors` | 列显示器（多屏选择 M4 用） |
+| `client --render-demo [vsync]` | 本地渲染管线自测（不走网络） |
+| `client --decode-demo <file>` | 解码自测 |
 
-## 已知限制（M1 记录，M4 处理）
+## 配置（rdlink.toml，可选）
 
-- Alt+Tab 等系统组合键会被主控端系统吃掉
-- 被控端中文输入法注入（M1 用英文输入法测试）
-- 主控端多屏选择（M1 固定主屏，`monitor_index` 配置已预留）
+放仓库根目录，不存在用默认值：
+
+```toml
+[host]
+port = 9527            # 监听端口
+cert_dir = "certs"     # 证书目录（首启自动生成）
+
+[client]
+vsync = false          # true = 渲染垂直同步（延迟+8~16ms，更省电）
+```
+
+编码参数走环境变量（冒烟/扫描用）：`RDLINK_BITRATE_MBPS`（默认 50）、`RDLINK_GOP`（默认 90）。
+
+## 环境搭建（新机器）
+
+1. **Rust** stable-msvc（rustup 默认安装）
+2. **VS Build Tools 2022**（C++ 桌面开发工作负载）
+3. **LLVM**（bindgen 需要）：`winget install LLVM.LLVM`
+4. **FFmpeg vendored**（git 忽略，手动放置）：BtbN `ffmpeg-n8.1-latest-win64-gpl-shared-8.1` 解压为 `third_party/ffmpeg/`
+5. 验证：`cargo build --workspace` 全绿 + `host --check` 显示编码器已注册
+
+运行时 DLL：调试期 `PATH=third_party/ffmpeg/bin:$PATH`，或把 DLL 拷到 exe 旁。
+
+## 运维通道（可选，主控端 SSH 直达被控端）
+
+被控端开 OpenSSH Server + 主控端公钥免密后：
+
+```
+ssh <user>@<被控端IP> "cd /d D:\AI\ConnectInternet\ConnectInternet && git pull && cargo build --release -p rdlink-host"
+ssh <user>@<被控端IP> "taskkill /IM host.exe /F & schtasks /Run /TN rdlink-host"   # 重启 host（桌面会话）
+```
+
+注意：SSH 会话**不能**直接运行 host（WGC 需桌面会话），用计划任务（`schtasks /Create /TN rdlink-host /TR "...start-host.bat" /SC ONCE /ST 00:00 /IT /F`）。
+
+## 架构速览
+
+```
+被控端 host.exe                          主控端 client.exe
+┌─────────────────────────┐             ┌──────────────────────────┐
+│ WGC 捕获(脏区驱动)        │             │ QUIC 收流                 │
+│ → 编码(NVENC→QSV→x264    │  QUIC v2    │ → 软解 h264(in-band SPS)  │
+│    三级兜底, CBR, 无B帧)  │ ──────────→ │ → BGRA                    │
+│ 背压: 有界通道整帧丢弃     │  视频流      │ → wgpu 直通渲染(230+fps)   │
+│ SendInput 注入 ←──────────┼──────────── │ winit 键鼠捕获→VK 映射     │
+│  [stats] 编码p50/p95/队列 │  输入流      │  标题栏: e2e/enc/dec/rtt  │
+└──────────┬──────────────┘             └──────────────────────────┘
+           └─ 控制流: Ping/Pong 四时间戳对时, Bye 优雅退出, 版本校验
+```
+
+证书：rcgen 自签 + SHA-256 指纹 pin（无 CA，指纹即身份）。
+
+## 性能基线（M1，docs/M1-基线数据.md）
+
+| 场景 | e2e p50 | 瓶颈 |
+|------|---------|------|
+| 本机闭环（4060） | 4~6ms | — |
+| 两机 Wi-Fi（被控端 QSV/x264） | 18~22ms | 编码 ~15ms |
+
+编码瓶颈的出路（M2）：被控端 D3D11 零拷贝直喂编码器（省 CPU 拷贝 8~10ms），或回滚 576.xx 驱动恢复 NVENC（2~5ms 级，需管理员）。
+
+## 已知限制
+
+- UAC 提权窗口无法注入（UIPI）；中文输入法注入未做（M4）
+- Alt+Tab 被主控端系统拦截（M4 键盘钩子）
+- 多屏选择/DPI 映射固定主屏主分辨率（M4）
+- 断线重连未做（断开需重连命令；host 自动回收会话等下一个连接）

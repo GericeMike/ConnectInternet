@@ -15,8 +15,22 @@ use tokio::sync::mpsc;
 
 use crate::encoder::{self, SendEncoder};
 
-/// 默认监听端口（M1 固定，M3 进配置）。
-pub const LISTEN_ADDR: &str = "0.0.0.0:9527";
+/// host 配置（rdlink.toml [host] 节，文件不存在用默认值：端口 9527、证书目录 certs/）
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+pub struct HostConf {
+    pub port: Option<u16>,
+    pub cert_dir: Option<String>,
+}
+
+pub fn load_conf() -> HostConf {
+    std::fs::read_to_string("rdlink.toml")
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+        .and_then(|v| v.get("host").cloned())
+        .and_then(|h| h.try_into::<HostConf>().ok())
+        .unwrap_or_default()
+}
 
 /// host 进程级时钟原点：VideoFrame.pts 与 Pong 时戳共用同一时钟域（对时前提）
 static HOST_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -39,11 +53,12 @@ pub fn run() {
 }
 
 async fn async_main() {
-    let listener = HostListener::listen(
-        LISTEN_ADDR.parse().expect("监听地址格式"),
-        Path::new("certs"),
-    )
-    .expect("监听失败（端口被占？删除 certs/ 可重新生成证书）");
+    let conf = load_conf();
+    let port = conf.port.unwrap_or(9527);
+    let cert_dir = conf.cert_dir.unwrap_or_else(|| "certs".into());
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().expect("监听地址格式");
+    let listener = HostListener::listen(addr, Path::new(&cert_dir))
+        .expect("监听失败（端口被占？删除 certs/ 可重新生成证书）");
 
     println!("rdlink-host 已就绪");
     println!("监听: {}", listener.local_addr().expect("local_addr"));

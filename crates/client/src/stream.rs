@@ -64,10 +64,27 @@ struct FrameBuf {
     recv_at: Instant,
 }
 
+/// client 配置（rdlink.toml [client] 节，文件不存在用默认值）
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ClientConf {
+    vsync: Option<bool>,
+}
+
+fn load_conf() -> ClientConf {
+    std::fs::read_to_string("rdlink.toml")
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+        .and_then(|v| v.get("client").cloned())
+        .and_then(|c| c.try_into::<ClientConf>().ok())
+        .unwrap_or_default()
+}
+
 pub fn run(addr: &str, pin: &str) {
     let _ = CLIENT_EPOCH.set(Instant::now());
+    let vsync = load_conf().vsync.unwrap_or(false);
     let event_loop = EventLoop::new().expect("事件循环创建失败");
-    let mut app = StreamApp::new(addr.to_string(), pin.to_string());
+    let mut app = StreamApp::new(addr.to_string(), pin.to_string(), vsync);
     event_loop.run_app(&mut app).expect("事件循环异常退出");
     println!("client 已退出");
 }
@@ -77,6 +94,8 @@ struct StreamApp {
     pin: String,
     window: Option<Arc<Window>>,
     display: Option<Display>,
+    /// 渲染 vsync 开关（rdlink.toml [client].vsync，默认关=低延迟）
+    display_vsync: bool,
     slot: FrameSlot,
     host_size: HostSize,
     /// 输入事件出口（winit 主线程 → 收流线程的发送任务）
@@ -96,12 +115,13 @@ struct StreamApp {
 }
 
 impl StreamApp {
-    fn new(addr: String, pin: String) -> Self {
+    fn new(addr: String, pin: String, vsync: bool) -> Self {
         Self {
             addr,
             pin,
             window: None,
             display: None,
+            display_vsync: vsync,
             slot: Arc::new(Mutex::new(None)),
             host_size: Arc::new(Mutex::new((0, 0))),
             input_tx: None,
@@ -391,7 +411,7 @@ impl ApplicationHandler for StreamApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("窗口创建失败"));
-        let mut display = Display::new(window.clone(), false);
+        let mut display = Display::new(window.clone(), self.display_vsync);
 
         println!("渲染就绪，连接 {} …（窗口模式 | F11 切全屏 | Esc 退出）", self.addr);
 
