@@ -1,6 +1,8 @@
 //! rdlink 主控端：QUIC 收流 → NVDEC 解码 → wgpu 渲染；捕获键鼠发往被控端。
 
 mod decode_demo;
+mod display;
+mod render_demo;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -13,8 +15,9 @@ fn main() {
             decode_demo::run(&input);
         }
         Some("--render-demo") => {
-            eprintln!("render-demo: 尚未实现（T6 交付：本地测试图渲染）");
-            std::process::exit(2);
+            // vsync 模式用于对照测量（决策 D3 默认 no-vsync）
+            let vsync = args.get(2).map(String::as_str) == Some("vsync");
+            render_demo::run(vsync);
         }
         _ => {
             println!("rdlink-client {} (主控端)", env!("CARGO_PKG_VERSION"));
