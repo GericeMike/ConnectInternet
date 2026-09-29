@@ -15,3 +15,4 @@ config.local.toml
 # tool internal state
 .mimosa/
 certs*/
+*.bundle
