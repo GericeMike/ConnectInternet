@@ -73,22 +73,39 @@ async fn serve_session(session: HostSession) {
 
     // free-threaded 启动：拿到 CaptureControl，会话结束后可从外部主动停止
     // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
-    let capture_control = start_capture(tx.clone());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let capture_control = start_capture(tx.clone(), ready_tx, backlog.clone());
+
+    // 首帧加速（T9 议题②）：静止桌面 WGC 不产帧，首个 IDR 要等真实画面变化。
+    // 捕获就绪后用 1px 光标微推制造脏区立即逼出一帧；300ms 后再推一次兜住边界竞态。
+    if ready_rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok() {
+        nudge_cursor();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        nudge_cursor();
+    }
 
     // 发送任务：拥有 video 流；channel 关闭或写失败即结束
+    let backlog2 = backlog.clone();
     let video_task = tokio::spawn(async move {
         let mut video = video;
         let mut sent = 0u64;
+        let mut bytes = 0u64;
         while let Some(frame) = rx.recv().await {
+            let len = frame.data.len() as u64;
             match write_frame(&mut video, &Message::VideoFrame(frame)).await {
-                Ok(()) => sent += 1,
+                Ok(()) => {
+                    sent += 1;
+                    bytes += len;
+                    backlog2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Err(e) => {
                     eprintln!("video 流写入失败（主控端断开?）: {e}");
                     break;
                 }
             }
         }
-        sent
+        (sent, bytes)
     });
 
     // 输入注入任务（T8）：Input 流 → SendInput。
@@ -145,7 +162,8 @@ async fn serve_session(session: HostSession) {
     drop(control_recv);
     let _ = tokio::task::spawn_blocking(move || capture_control.stop()).await;
     if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_secs(10), video_task).await {
-        println!("共发送 {} 帧视频", sent.unwrap_or(0));
+        let (sent, bytes) = sent.unwrap_or((0, 0));
+        println!("共发送 {sent} 帧视频（{:.1} MiB）", bytes as f64 / 1048576.0);
     }
     if let Ok(Ok((injected, dropped))) =
         tokio::time::timeout(std::time::Duration::from_secs(5), input_task).await
@@ -171,9 +189,14 @@ use windows_capture::settings::{
 struct ServeCapture {
     enc: SendEncoder,
     tx: mpsc::UnboundedSender<VideoFrame>,
+    /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
+    backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     start: Instant,
-    frames: u64,
+    /// 本统计窗口内的帧数（5s 重置，算窗口 fps）
+    window_frames: u64,
     encoded: u64,
+    /// 本窗口编码耗时样本（µs，报告后清空）
+    enc_us: Vec<u64>,
     last_report: Instant,
     scratch: Vec<u8>,
     /// 编码器名称（日志）
@@ -181,12 +204,16 @@ struct ServeCapture {
 }
 
 impl GraphicsCaptureApiHandler for ServeCapture {
-    /// Flags 即捕获线程的出口通道（经 Settings 注入）
-    type Flags = mpsc::UnboundedSender<VideoFrame>;
+    /// Flags：出口通道 + 就绪信号 + 队列深度计数（经 Settings 注入）
+    type Flags = (
+        mpsc::UnboundedSender<VideoFrame>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    );
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let tx = ctx.flags;
+        let (tx, ready, backlog) = ctx.flags;
         let monitor = windows_capture::monitor::Monitor::primary()?;
         let (w, h) = (monitor.width()?, monitor.height()?);
         let (enc, tier) = encoder::open_auto(w, h)?;
@@ -197,12 +224,16 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             encoder::EncoderTier::X264 => "x264 软编兜底",
         };
         println!("[capture] 编码器: {enc_name}（{tier_label}）@ {w}x{h}");
+        // 通知主任务：WGC 会话已建立，可以推首帧了
+        let _ = ready.send(());
         Ok(Self {
             enc: SendEncoder(enc),
             tx,
+            backlog,
             start: Instant::now(),
-            frames: 0,
+            window_frames: 0,
             encoded: 0,
+            enc_us: Vec::new(),
             last_report: Instant::now(),
             scratch: Vec::new(),
             enc_name,
@@ -220,7 +251,9 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         {
             let fb = frame.buffer()?;
             let bgra = fb.as_nopadding_buffer(&mut self.scratch);
+            let t0 = Instant::now();
             let packets = self.enc.0.encode(bgra, w * 4, pts_us)?;
+            self.enc_us.push(t0.elapsed().as_micros() as u64);
             for p in packets {
                 self.encoded += 1;
                 if self
@@ -236,19 +269,27 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                     ctrl.stop();
                     return Ok(());
                 }
+                self.backlog
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        self.frames += 1;
+        self.window_frames += 1;
         if self.last_report.elapsed().as_secs_f32() >= 5.0 {
-            let secs = self.start.elapsed().as_secs_f32();
+            let window_s = self.last_report.elapsed().as_secs_f32();
+            let (p50, p95) = pct2(&mut self.enc_us, 0.50, 0.95);
             println!(
-                "[capture] {} {:.0}fps | 编码 {} 包 ({})",
-                self.enc_name,
-                self.frames as f32 / secs,
+                "[stats] {:.1}s: {:.1}fps | 编码 p50={:.1}ms p95={:.1}ms | 待发队列 {} | 累计 {} 包（{}）",
+                self.start.elapsed().as_secs_f32(),
+                self.window_frames as f32 / window_s,
+                p50 as f64 / 1000.0,
+                p95 as f64 / 1000.0,
+                self.backlog.load(std::sync::atomic::Ordering::Relaxed),
                 self.encoded,
-                secs as u64
+                self.enc_name,
             );
+            self.window_frames = 0;
+            self.enc_us.clear();
             self.last_report = Instant::now();
         }
         Ok(())
@@ -260,9 +301,29 @@ impl GraphicsCaptureApiHandler for ServeCapture {
     }
 }
 
+/// 窗口样本的 p50/p95（µs）；样本耗尽返回 (0,0)
+fn pct2(samples: &mut [u64], a: f64, b: f64) -> (u64, u64) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    samples.sort_unstable();
+    let at = |p: f64| samples[((samples.len() as f64 - 1.0) * p).round() as usize];
+    (at(a), at(b))
+}
+
+/// 1px 光标微推：制造脏区逼 WGC 出帧（首帧加速的最小实现）
+fn nudge_cursor() {
+    let (x, y) = crate::input::cursor_pos();
+    let (x, y) = (x.max(0) as u32, y.max(0) as u32);
+    let _ = crate::input::inject(&rdlink_proto::InputEvent::MouseMove { x: x + 1, y });
+    let _ = crate::input::inject(&rdlink_proto::InputEvent::MouseMove { x, y });
+}
+
 /// 启动捕获（自由线程）：返回外部控制句柄，会话结束用 `stop()` 主动回收。
 fn start_capture(
     tx: mpsc::UnboundedSender<VideoFrame>,
+    ready: std::sync::mpsc::Sender<()>,
+    backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> windows_capture::capture::CaptureControl<ServeCapture, Box<dyn std::error::Error + Send + Sync>> {
     let monitor = windows_capture::monitor::Monitor::primary().expect("主显示器");
     let settings = Settings::new(
@@ -273,7 +334,7 @@ fn start_capture(
         MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        tx,
+        (tx, ready, backlog),
     );
     ServeCapture::start_free_threaded(settings).expect("捕获启动失败")
 }
