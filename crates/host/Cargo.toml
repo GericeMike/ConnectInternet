@@ -10,5 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 rdlink-proto = { path = "../proto" }
+rdlink-transport = { path = "../transport" }
 ffmpeg-the-third = "6"
 windows-capture = "2.0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros"] }
+# T8 将加入: windows（SendInput）

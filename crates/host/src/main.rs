@@ -1,7 +1,8 @@
-//! rdlink 被控端：屏幕捕获 → NVENC 编码 → QUIC 发送；接收输入事件并注入。
+//! rdlink 被控端：屏幕捕获 → 编码 → QUIC 发送；接收输入事件并注入。
 
 mod capture;
 mod encoder;
+mod serve;
 
 use ffmpeg_the_third as ffmpeg;
 
@@ -12,11 +13,7 @@ fn main() {
         Some("--capture-demo") => capture::capture_demo(),
         Some("--encode-demo") => capture::encode_demo(),
         Some("--list-monitors") => capture::list_monitors(),
-        _ => {
-            println!("rdlink-host {} (被控端)", env!("CARGO_PKG_VERSION"));
-            println!("协议版本: {}", rdlink_proto::PROTOCOL_VERSION);
-            println!("正常运行模式将在 T7 接通（监听 QUIC + 视频链路）");
-        }
+        _ => serve::run(), // 正常运行模式（T7）
     }
 }
 

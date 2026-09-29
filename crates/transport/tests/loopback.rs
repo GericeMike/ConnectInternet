@@ -21,7 +21,12 @@ async fn handshake_and_exchange_all_three_channels() {
 
     // host 侧：握手 → 回 Ping → 在 Video 通道发一帧 → 读一条 Input
     let host_task = tokio::spawn(async move {
-        let mut session = listener.accept(None).await.expect("host accept");
+        let info = ControlMsg::VideoStreamInfo {
+            width: 1920,
+            height: 1080,
+            extradata: vec![1, 2, 3],
+        };
+        let mut session = listener.accept(info).await.expect("host accept");
 
         // Control: 收 Ping 回 Pong
         if let Some(Message::Control(ControlMsg::Ping { t_us })) =

@@ -88,7 +88,11 @@ impl HostListener {
     }
 
     /// 等待并接受一个 client，完成三通道握手。
-    pub async fn accept(&self, expected_client: Option<&str>) -> Result<HostSession, SessionError> {
+    /// `video_info` 携带真实捕获分辨率/解码参数，随握手下发（T7）。
+    pub async fn accept(
+        &self,
+        video_info: ControlMsg,
+    ) -> Result<HostSession, SessionError> {
         // 服务器无限期等待新连接；超时只约束握手各步骤
         let incoming = self
             .endpoint
@@ -98,13 +102,13 @@ impl HostListener {
         let conn = incoming
             .await
             .map_err(|e| SessionError::Io(e.to_string()))?;
-        self.handshake(conn, expected_client).await
+        self.handshake(conn, video_info).await
     }
 
     async fn handshake(
         &self,
         conn: Connection,
-        expected_client: Option<&str>,
+        video_info: ControlMsg,
     ) -> Result<HostSession, SessionError> {
         let (mut control_send, mut control_recv) = timeout("host-accept-bi", conn.accept_bi()).await?;
 
@@ -126,28 +130,12 @@ impl HostListener {
             }
             _ => return Err(SessionError::Handshake("期望 Hello".into())),
         };
-        if let Some(expect) = expected_client {
-            if hello.1 != expect {
-                return Err(SessionError::Handshake(format!(
-                    "未知主控端: {}（期望 {expect}）",
-                    hello.1
-                )));
-            }
-        }
 
         // QUIC 语义：uni 流必须写入首帧对端才可见。
-        // 顺序：开 Video 流并立刻写 VideoStreamInfo（首帧激活）
+        // 顺序：开 Video 流并立刻写 VideoStreamInfo（首帧激活，携带真实参数）
         //      → 回 HelloAck → 收 Input 流（其首帧为 InputStreamReady）
         let mut video = timeout("open-uni", conn.open_uni()).await?;
-        write_frame(
-            &mut video,
-            &Message::Control(ControlMsg::VideoStreamInfo {
-                width: 0, // T4 接入真实捕获分辨率
-                height: 0,
-                extradata: Vec::new(),
-            }),
-        )
-        .await?;
+        write_frame(&mut video, &Message::Control(video_info)).await?;
         write_frame(
             &mut control_send,
             &Message::Control(ControlMsg::HelloAck {
@@ -188,6 +176,8 @@ pub struct HostSession {
 
 pub struct ClientSession {
     pub peer_name: String,
+    /// host 随握手下发的视频参数（分辨率/extradata）
+    pub video_info: ControlMsg,
     pub control_send: SendStream,
     pub control_recv: RecvStream,
     pub video: RecvStream,
@@ -243,15 +233,16 @@ pub async fn connect(
 
     // 3. Video 流（首帧 VideoStreamInfo 已随建流写入）→ Input 流（open 后立刻写首帧激活）
     let mut video = timeout("accept-uni", conn.accept_uni()).await?;
-    match read_frame(&mut video).await? {
-        Some(Message::Control(ControlMsg::VideoStreamInfo { .. })) => {}
+    let video_info = match read_frame(&mut video).await? {
+        Some(Message::Control(info @ ControlMsg::VideoStreamInfo { .. })) => info,
         other => return Err(SessionError::Handshake(format!("期望 VideoStreamInfo，得到 {other:?}"))),
-    }
+    };
     let mut input = timeout("open-uni", conn.open_uni()).await?;
     write_frame(&mut input, &Message::Control(ControlMsg::InputStreamReady)).await?;
 
     Ok(ClientSession {
         peer_name: ack,
+        video_info,
         control_send,
         control_recv,
         video,

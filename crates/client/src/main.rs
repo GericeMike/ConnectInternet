@@ -1,8 +1,10 @@
-//! rdlink 主控端：QUIC 收流 → NVDEC 解码 → wgpu 渲染；捕获键鼠发往被控端。
+//! rdlink 主控端：QUIC 收流 → 解码 → wgpu 渲染；捕获键鼠发往被控端。
 
 mod decode_demo;
+mod decoder;
 mod display;
 mod render_demo;
+mod stream;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -19,10 +21,21 @@ fn main() {
             let vsync = args.get(2).map(String::as_str) == Some("vsync");
             render_demo::run(vsync);
         }
+        Some("--host") => {
+            // 正常运行模式（T7）：client --host <ip:port> <证书指纹>
+            let (addr, pin) = match (args.get(2), args.get(3)) {
+                (Some(a), Some(p)) => (a.clone(), p.clone()),
+                _ => {
+                    eprintln!("用法: client --host <ip:port> <证书指纹>（指纹看 host 启动输出）");
+                    std::process::exit(2);
+                }
+            };
+            stream::run(&addr, &pin);
+        }
         _ => {
             println!("rdlink-client {} (主控端)", env!("CARGO_PKG_VERSION"));
-            println!("协议版本: {}", rdlink_proto::PROTOCOL_VERSION);
-            println!("正常运行模式将在 T7 接通：client.exe --host <ip>:<port>");
+            println!("运行模式: client --host <ip:port> <指纹>");
+            println!("辅助: --render-demo [vsync] | --decode-demo <文件>");
         }
     }
 }

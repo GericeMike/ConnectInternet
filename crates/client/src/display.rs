@@ -39,6 +39,8 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 "#;
 
 pub struct Display {
+    /// 持有窗口句柄（渲染期间保活；后续 T8 输入捕获可能直接使用）
+    #[allow(dead_code)]
     pub window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,

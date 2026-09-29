@@ -19,7 +19,12 @@ async fn main() {
     println!("监听 {}", listener.local_addr().unwrap());
     println!("证书指纹（填给 bench_client）: {}", listener.fingerprint);
 
-    let mut session = listener.accept(None).await.expect("accept");
+    let info = ControlMsg::VideoStreamInfo {
+        width: 1920,
+        height: 1080,
+        extradata: Vec::new(),
+    };
+    let mut session = listener.accept(info).await.expect("accept");
     println!("已连接主控端: {}", session.peer_name);
 
     // RTT：echo ping
