@@ -10,4 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 rdlink-proto = { path = "../proto" }
-# T5/T6/T8 将加入: ffmpeg-the-third, winit, wgpu, rdlink-transport
+ffmpeg-the-third = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+# T6/T8 将加入: winit, wgpu, rdlink-transport
