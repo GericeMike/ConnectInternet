@@ -27,18 +27,23 @@ async fn main() {
     let mut session = listener.accept(info).await.expect("accept");
     println!("已连接主控端: {}", session.peer_name);
 
-    // RTT：echo ping
+    // RTT：echo ping（带哑元 host 时戳）
     for _ in 0..PINGS {
-        match read_frame(&mut session.control_recv).await.unwrap() {
-            Some(Message::Control(ControlMsg::Ping { t_us })) => {
-                write_frame(
-                    &mut session.control_send,
-                    &Message::Control(ControlMsg::Pong { t_us }),
-                )
-                .await
-                .unwrap();
-            }
-            _ => panic!("期望 Ping"),
+        if let Some(Message::Control(ControlMsg::Ping { t_us })) =
+            read_frame(&mut session.control_recv).await.unwrap()
+        {
+            write_frame(
+                &mut session.control_send,
+                &Message::Control(ControlMsg::Pong {
+                    t_us,
+                    host_recv_us: 0,
+                    host_send_us: 0,
+                }),
+            )
+            .await
+            .unwrap();
+        } else {
+            panic!("期望 Ping");
         }
     }
 
@@ -51,6 +56,7 @@ async fn main() {
             &Message::VideoFrame(VideoFrame {
                 capture_pts_us: i as i64,
                 key: i % 30 == 0,
+                encode_us: 5000,
                 data: payload.clone(),
             }),
         )

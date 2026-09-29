@@ -18,7 +18,19 @@ use crate::encoder::{self, SendEncoder};
 /// 默认监听端口（M1 固定，M3 进配置）。
 pub const LISTEN_ADDR: &str = "0.0.0.0:9527";
 
+/// host 进程级时钟原点：VideoFrame.pts 与 Pong 时戳共用同一时钟域（对时前提）
+static HOST_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// host epoch 起的微秒数
+fn epoch_us() -> i64 {
+    HOST_EPOCH
+        .get()
+        .map(|t| t.elapsed().as_micros() as i64)
+        .unwrap_or(0)
+}
+
 pub fn run() {
+    let _ = HOST_EPOCH.set(Instant::now());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -75,17 +87,54 @@ async fn serve_session(session: HostSession) {
     // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
     let capture_control = start_capture(tx.clone());
 
-    // 发送任务：拥有 video 流；channel 关闭或写失败即结束
+    // 首帧优化（T9）：静止桌面 WGC 不产帧，连接后要等画面变化才有 IDR。
+    // 主动注入 1px 光标往返移动触发脏区，把首帧从"秒级等待"压到立即。
+    tokio::task::spawn_blocking(|| {
+        let (x, y) = crate::input::cursor_pos();
+        let _ = crate::input::inject(&rdlink_proto::InputEvent::MouseMove {
+            x: (x + 1).max(0) as u32,
+            y: y.max(0) as u32,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = crate::input::inject(&rdlink_proto::InputEvent::MouseMove {
+            x: x.max(0) as u32,
+            y: y.max(0) as u32,
+        });
+    });
+
+    // 发送任务：拥有 video 流；channel 关闭或写失败即结束。
+    // 附带 host 侧分段统计：capture→send 总延迟（含编码+排队+网络写）
     let video_task = tokio::spawn(async move {
         let mut video = video;
         let mut sent = 0u64;
+        let mut lat_sum = 0u64;
+        let mut lat_max = 0u64;
+        let mut last_report = Instant::now();
         while let Some(frame) = rx.recv().await {
-            match write_frame(&mut video, &Message::VideoFrame(frame)).await {
-                Ok(()) => sent += 1,
+            match write_frame(&mut video, &Message::VideoFrame(frame.clone())).await {
+                Ok(()) => {
+                    sent += 1;
+                    let lat = (epoch_us() - frame.capture_pts_us).max(0) as u64;
+                    lat_sum += lat;
+                    lat_max = lat_max.max(lat);
+                }
                 Err(e) => {
                     eprintln!("video 流写入失败（主控端断开?）: {e}");
                     break;
                 }
+            }
+            if last_report.elapsed().as_secs() >= 5 && sent > 0 {
+                println!(
+                    "[send] {}fps | capture→send 平均 {}ms / 最大 {}ms | 帧内编码 {}ms",
+                    sent / last_report.elapsed().as_secs().max(1),
+                    lat_sum / sent / 1000,
+                    lat_max / 1000,
+                    0 // 编码耗时由 client 从 VideoFrame.encode_us 汇总展示
+                );
+                sent = 0;
+                lat_sum = 0;
+                lat_max = 0;
+                last_report = Instant::now();
             }
         }
         sent
@@ -116,11 +165,23 @@ async fn serve_session(session: HostSession) {
         (injected, dropped)
     });
 
-    // Control 通道：Ping→Pong / Bye / 断开检测
+    // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开检测
     loop {
         match read_frame(&mut control_recv).await {
             Ok(Some(Message::Control(ControlMsg::Ping { t_us }))) => {
-                let _ = write_frame(&mut control_send, &Message::Control(ControlMsg::Pong { t_us })).await;
+                let host_recv_us = epoch_us();
+                let r = write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::Pong {
+                        t_us,
+                        host_recv_us,
+                        host_send_us: epoch_us(),
+                    }),
+                )
+                .await;
+                if r.is_err() {
+                    break;
+                }
             }
             Ok(Some(Message::Control(ControlMsg::Bye { reason }))) => {
                 println!("主控端主动断开: {reason}");
@@ -214,13 +275,16 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         frame: &mut Frame,
         ctrl: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let pts_us = self.start.elapsed().as_micros() as i64;
+        let pts_us = epoch_us();
         let w = frame.width() as usize;
 
+        let enc_us;
         {
             let fb = frame.buffer()?;
             let bgra = fb.as_nopadding_buffer(&mut self.scratch);
+            let t0 = Instant::now();
             let packets = self.enc.0.encode(bgra, w * 4, pts_us)?;
+            enc_us = t0.elapsed().as_micros() as u32;
             for p in packets {
                 self.encoded += 1;
                 if self
@@ -228,6 +292,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                     .send(VideoFrame {
                         capture_pts_us: p.pts_us,
                         key: p.key,
+                        encode_us: enc_us,
                         data: p.data,
                     })
                     .is_err()
@@ -243,11 +308,11 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         if self.last_report.elapsed().as_secs_f32() >= 5.0 {
             let secs = self.start.elapsed().as_secs_f32();
             println!(
-                "[capture] {} {:.0}fps | 编码 {} 包 ({})",
+                "[capture] {} {:.0}fps | 编码 {} 包 | 最近编码耗时 {}ms",
                 self.enc_name,
                 self.frames as f32 / secs,
                 self.encoded,
-                secs as u64
+                enc_us / 1000,
             );
             self.last_report = Instant::now();
         }

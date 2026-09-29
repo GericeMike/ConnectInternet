@@ -28,13 +28,17 @@ async fn handshake_and_exchange_all_three_channels() {
         };
         let mut session = listener.accept(info).await.expect("host accept");
 
-        // Control: 收 Ping 回 Pong
+        // Control: 收 Ping 回 Pong（带 host 时戳）
         if let Some(Message::Control(ControlMsg::Ping { t_us })) =
             read_frame(&mut session.control_recv).await.unwrap()
         {
             write_frame(
                 &mut session.control_send,
-                &Message::Control(ControlMsg::Pong { t_us }),
+                &Message::Control(ControlMsg::Pong {
+                    t_us,
+                    host_recv_us: t_us + 10,
+                    host_send_us: t_us + 15,
+                }),
             )
             .await
             .unwrap();
@@ -101,7 +105,7 @@ async fn handshake_and_exchange_all_three_channels() {
 
     let host_seen_name = host_task.await.unwrap();
     assert_eq!(host_seen_name, "test-client");
-    assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(PROTOCOL_VERSION, 2);
 }
 
 #[tokio::test]

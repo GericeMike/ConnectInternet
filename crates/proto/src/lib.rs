@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 /// 协议版本号。两端 Hello 阶段校验，不一致则拒绝连接。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: VideoFrame 加 encode_us；Pong 加 host_recv_us/host_send_us（T9 打点）
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -44,9 +45,12 @@ pub enum ControlMsg {
     },
     /// client → host：**Input uni 流首帧**，作用同上（流激活）。
     InputStreamReady,
-    /// 双向：测量 RTT
+    /// 双向：测量 RTT + 估算两机时钟偏移（client 发）
+    /// t_us = 发送时刻（client 时钟，epoch 微秒）
     Ping { t_us: i64 },
-    Pong { t_us: i64 },
+    /// host 回：携带 host 收/发时刻（host 时钟，epoch 微秒）。
+    /// client 用四时间戳法算 offset = ((hr+hs)/2) - ((t_send+t_recv)/2)
+    Pong { t_us: i64, host_recv_us: i64, host_send_us: i64 },
     /// 优雅断开
     Bye { reason: String },
 }
@@ -54,10 +58,12 @@ pub enum ControlMsg {
 /// 一帧编码后的 H.264 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoFrame {
-    /// 采集时刻（host 单调时钟，微秒），用于延迟统计
+    /// 采集时刻（host epoch 单调时钟，微秒），用于延迟统计
     pub capture_pts_us: i64,
     /// 是否关键帧（IDR）。client 在收到首个 key=true 前不送解码器。
     pub key: bool,
+    /// host 侧编码耗时（采集回调内，微秒）——分段打点用
+    pub encode_us: u32,
     pub data: Vec<u8>,
 }
 
@@ -205,10 +211,16 @@ mod tests {
         }));
         roundtrip(Message::Control(ControlMsg::InputStreamReady));
         roundtrip(Message::Control(ControlMsg::Ping { t_us: 12345 }));
+        roundtrip(Message::Control(ControlMsg::Pong {
+            t_us: 12345,
+            host_recv_us: 67890,
+            host_send_us: 67899,
+        }));
         roundtrip(Message::Control(ControlMsg::Bye { reason: "测试".into() }));
         roundtrip(Message::VideoFrame(VideoFrame {
             capture_pts_us: 999_999,
             key: true,
+            encode_us: 5210,
             data: vec![1, 2, 3, 4, 5],
         }));
         roundtrip(Message::Input(InputEvent::MouseMove { x: 1920, y: 0 }));
@@ -227,6 +239,7 @@ mod tests {
         let msg = Message::VideoFrame(VideoFrame {
             capture_pts_us: 42,
             key: true,
+            encode_us: 4800,
             data: vec![0xAB; 300_000],
         });
         let bytes = encode(&msg).unwrap();
@@ -247,6 +260,7 @@ mod tests {
             Message::VideoFrame(VideoFrame {
                 capture_pts_us: 7,
                 key: false,
+                encode_us: 4100,
                 data: vec![9; 4096],
             }),
         ];
