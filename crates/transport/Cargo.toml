@@ -5,4 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# T2 将加入: quinn, rustls, rcgen, tokio, rdlink-proto
+rdlink-proto = { path = "../proto" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+sha2 = "0.10"
+hex = "0.4"

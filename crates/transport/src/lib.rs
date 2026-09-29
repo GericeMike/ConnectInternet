@@ -1,12 +1,16 @@
 //! rdlink-transport：QUIC 传输层。
 //!
-//! 职责（M1/T2 交付）：
-//! - host 侧监听 / client 侧连接（quinn + rustls）
-//! - 三条固定 stream：Control(0, 双向)、Video(1, host→client)、Input(2, client→host)
-//! - 证书：rcgen 运行时生成自签证书（决策 D5），指纹 pin 进配置
-//! - 为 M2 的 datagram 迁移预留 trait 抽象：
+//! - [`cert`]：rcgen 自签证书 + 指纹 pin（决策 D5）
+//! - [`frame`]：quinn 流上的异步帧读写
+//! - [`session`]：host 监听 / client 连接 + 三通道握手
+//!   （Control 双向、Video host→client、Input client→host）
 //!
-//! ```ignore
-//! trait VideoSink   { async fn send_frame(&self, f: EncodedFrame); }
-//! trait VideoSource { async fn next_frame(&self) -> Option<EncodedFrame>; }
-//! ```
+//! M2 将在此层为视频通道增加 datagram 实现（`VideoSink`/`VideoSource` trait），
+//! M1 视频走可靠流（决策 D1）。
+
+pub mod cert;
+pub mod frame;
+pub mod session;
+
+pub use frame::{read_frame, write_frame, FrameError};
+pub use session::{connect, ClientSession, HostListener, HostSession, SessionError};

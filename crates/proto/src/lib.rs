@@ -28,13 +28,22 @@ pub enum Message {
 pub enum ControlMsg {
     /// client → host：发起连接
     Hello { proto_version: u32, client_name: String },
-    /// host → client：接受连接，回传视频参数
+    /// host → client：接受连接（Control 通道）
     HelloAck {
         proto_version: u32,
         host_name: String,
-        /// SPS/PPS 等解码器初始化数据
+    },
+    /// host → client：**Video uni 流首帧**。
+    /// QUIC 语义：uni 流必须写入首帧数据对端才可见（accept_uni 才能返回），
+    /// 因此建流与元信息下发绑定为原子操作。
+    VideoStreamInfo {
+        width: u32,
+        height: u32,
+        /// SPS/PPS 等解码器初始化数据（T4 接入真实值）
         extradata: Vec<u8>,
     },
+    /// client → host：**Input uni 流首帧**，作用同上（流激活）。
+    InputStreamReady,
     /// 双向：测量 RTT
     Ping { t_us: i64 },
     Pong { t_us: i64 },
@@ -104,7 +113,7 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// 编码一条消息为带长度前缀的字节帧。
+/// 解码一条带长度前缀的字节帧。
 pub fn encode(msg: &Message) -> Result<Vec<u8>, EncodeError> {
     let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .expect("bincode 编码不应失败（无 IO）");
@@ -115,6 +124,13 @@ pub fn encode(msg: &Message) -> Result<Vec<u8>, EncodeError> {
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+/// 反序列化帧载荷（不含长度前缀）。供传输层使用。
+pub fn decode(payload: &[u8]) -> Result<Message, DecodeError> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map(|(msg, _)| msg)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))
 }
 
 /// 流式帧解码器：喂入任意切割的字节流，逐条弹出完整消息。
@@ -181,8 +197,13 @@ mod tests {
         roundtrip(Message::Control(ControlMsg::HelloAck {
             proto_version: PROTOCOL_VERSION,
             host_name: "mx250".into(),
+        }));
+        roundtrip(Message::Control(ControlMsg::VideoStreamInfo {
+            width: 1920,
+            height: 1080,
             extradata: vec![0x67, 0x64, 0x00, 0x1f],
         }));
+        roundtrip(Message::Control(ControlMsg::InputStreamReady));
         roundtrip(Message::Control(ControlMsg::Ping { t_us: 12345 }));
         roundtrip(Message::Control(ControlMsg::Bye { reason: "测试".into() }));
         roundtrip(Message::VideoFrame(VideoFrame {
