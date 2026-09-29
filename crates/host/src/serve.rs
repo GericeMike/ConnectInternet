@@ -291,7 +291,6 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         let pts_us = epoch_us();
         let w = frame.width() as usize;
 
-        let enc_us;
         {
             let fb = frame.buffer()?;
             let bgra = fb.as_nopadding_buffer(&mut self.scratch);
