@@ -1897,6 +1897,7 @@ dependencies = [
  "rdlink-proto",
  "rdlink-transport",
  "tokio",
+ "windows",
  "windows-capture",
 ]
 

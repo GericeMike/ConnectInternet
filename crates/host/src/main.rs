@@ -2,6 +2,7 @@
 
 mod capture;
 mod encoder;
+mod input;
 mod serve;
 
 use ffmpeg_the_third as ffmpeg;
@@ -13,7 +14,8 @@ fn main() {
         Some("--capture-demo") => capture::capture_demo(),
         Some("--encode-demo") => capture::encode_demo(),
         Some("--list-monitors") => capture::list_monitors(),
-        _ => serve::run(), // 正常运行模式（T7）
+        Some("--input-demo") => input::input_demo(),
+        _ => serve::run(), // 正常运行模式（T7 视频 + T8 输入注入待接）
     }
 }
 
