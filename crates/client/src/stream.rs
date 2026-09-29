@@ -53,6 +53,8 @@ struct StreamApp {
     host_size: HostSize,
     /// 输入事件出口（winit 主线程 → 收流线程的发送任务）
     input_tx: Option<mpsc::UnboundedSender<InputEvent>>,
+    /// 退出信号（主线程 → 收流线程：先把 Bye 真正发完再退出）
+    shutdown_tx: Option<mpsc::Sender<()>>,
     fullscreen: bool,
     // 渲染统计
     rendered: u64,
@@ -73,6 +75,7 @@ impl StreamApp {
             slot: Arc::new(Mutex::new(None)),
             host_size: Arc::new(Mutex::new((0, 0))),
             input_tx: None,
+            shutdown_tx: None,
             fullscreen: false,
             rendered: 0,
             last_title: Instant::now(),
@@ -92,6 +95,7 @@ impl StreamApp {
         &self,
         window: Arc<Window>,
         input_rx: mpsc::UnboundedReceiver<InputEvent>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) {
         let addr = self.addr.clone();
         let pin = self.pin.clone();
@@ -104,9 +108,18 @@ impl StreamApp {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(stream_loop(addr, pin, slot, host_size, window, input_rx));
+                rt.block_on(stream_loop(addr, pin, slot, host_size, window, input_rx, shutdown_rx));
             })
             .expect("收流线程创建失败");
+    }
+
+    /// 通知收流线程优雅收尾（发 Bye），并给它一点时间真正送出
+    fn begin_shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.blocking_send(());
+            // Bye 很小，1.5s 足够 QUIC 完成发送
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
     }
 }
 
@@ -118,6 +131,7 @@ async fn stream_loop(
     host_size: HostSize,
     window: Arc<Window>,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let t0 = Instant::now();
     let session = match connect(
@@ -155,8 +169,8 @@ async fn stream_loop(
         *host_size.lock().unwrap() = (*width, *height);
     }
 
-    // 输入发送任务：winit 主线程 → input_rx → Input 流
-    let input_task = tokio::spawn(async move {
+    // 输入发送任务：winit 主线程 → input_rx → Input 流（随进程退出结束）
+    tokio::spawn(async move {
         let mut sent = 0u64;
         while let Some(ev) = input_rx.recv().await {
             if write_frame(&mut input, &Message::Input(ev)).await.is_err() {
@@ -178,11 +192,22 @@ async fn stream_loop(
     let mut skipped_before_idr = 0u64;
     let mut decode_buf: Vec<u8> = Vec::new();
 
-    while let Some(msg) = read_frame(&mut video).await.transpose() {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("video 流错误: {e}");
+    loop {
+        // select 场景取消 read_frame 半读会丢帧——仅在退出时发生，可接受
+        let msg = tokio::select! {
+            m = read_frame(&mut video) => match m.transpose() {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    eprintln!("video 流错误: {e}");
+                    break;
+                }
+                None => {
+                    println!("video 流关闭");
+                    break;
+                }
+            },
+            _ = shutdown_rx.recv() => {
+                println!("收到退出信号，收尾中…");
                 break;
             }
         };
@@ -223,13 +248,14 @@ async fn stream_loop(
         }
     }
 
-    // 干净退出：通知 host
+    // 干净退出：发 Bye（host 立刻感知回收，不干等 idle timeout）。
+    // input 发送任务随进程退出结束；App 主线程此时在等 1.5s 让 Bye 上线路。
     let _ = write_frame(
         &mut control_send,
         &Message::Control(ControlMsg::Bye { reason: "client 退出".into() }),
     )
     .await;
-    println!("video 流结束（共解码 {} 帧，输入事件已发 {} 条）", decoder.frames, input_task.await.unwrap_or(0));
+    println!("video 流结束（共解码 {} 帧）", decoder.frames);
 }
 
 impl ApplicationHandler for StreamApp {
@@ -250,7 +276,9 @@ impl ApplicationHandler for StreamApp {
         self.connect_started = Some(Instant::now());
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         self.input_tx = Some(input_tx);
-        self.spawn_stream_thread(window.clone(), input_rx);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        self.shutdown_tx = Some(shutdown_tx);
+        self.spawn_stream_thread(window.clone(), input_rx, shutdown_rx);
         display.render();
         self.display = Some(display);
         self.window = Some(window);
@@ -260,7 +288,10 @@ impl ApplicationHandler for StreamApp {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.begin_shutdown();
+                event_loop.exit();
+            }
 
             WindowEvent::Resized(size) => {
                 if let Some(d) = self.display.as_mut() {
@@ -273,7 +304,10 @@ impl ApplicationHandler for StreamApp {
                 // 本地热键
                 if event.state == ElementState::Pressed {
                     match event.logical_key {
-                        Key::Named(NamedKey::Escape) => event_loop.exit(),
+                        Key::Named(NamedKey::Escape) => {
+                            self.begin_shutdown();
+                            event_loop.exit();
+                        }
                         Key::Named(NamedKey::F11) => {
                             self.fullscreen = !self.fullscreen;
                             if self.fullscreen {

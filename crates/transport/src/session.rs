@@ -73,10 +73,20 @@ impl HostListener {
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
             .map_err(|e| SessionError::Io(e.to_string()))?;
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .map_err(|e| SessionError::Io(e.to_string()))?,
         ));
+        // 对端异常消失（进程被杀/断电，无 CONNECTION_CLOSE）时的兜底：
+        // 默认 30s 太长——期间 accept 循环阻塞在会话回收上，新连接进不来
+        {
+            let mut tp = quinn::TransportConfig::default();
+            tp.max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(std::time::Duration::from_secs(10))
+                    .expect("idle timeout"),
+            ));
+            server_config.transport_config(Arc::new(tp));
+        }
 
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| SessionError::Io(e.to_string()))?;

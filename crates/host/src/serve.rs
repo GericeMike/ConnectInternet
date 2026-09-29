@@ -71,13 +71,9 @@ async fn serve_session(session: HostSession) {
     // 捕获线程 → channel → 发送任务
     let (tx, mut rx) = mpsc::unbounded_channel::<VideoFrame>();
 
-    let capture_thread = {
-        let tx = tx.clone();
-        std::thread::Builder::new()
-            .name("rdlink-capture".into())
-            .spawn(move || run_capture(tx))
-            .expect("捕获线程创建失败")
-    };
+    // free-threaded 启动：拿到 CaptureControl，会话结束后可从外部主动停止
+    // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
+    let capture_control = start_capture(tx.clone());
 
     // 发送任务：拥有 video 流；channel 关闭或写失败即结束
     let video_task = tokio::spawn(async move {
@@ -142,10 +138,12 @@ async fn serve_session(session: HostSession) {
         }
     }
 
-    // 回收：drop 剩余 tx → 捕获线程 send 失败自停 → channel 排空 → 发送任务结束
+    // 回收：drop 剩余 tx → 主动停捕获（WM_QUIT；静止桌面时线程不会自己发现通道关闭）
+    //      → channel 排空 → 发送/注入任务结束
     drop(tx);
     drop(control_send);
     drop(control_recv);
+    let _ = tokio::task::spawn_blocking(move || capture_control.stop()).await;
     if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_secs(10), video_task).await {
         println!("共发送 {} 帧视频", sent.unwrap_or(0));
     }
@@ -156,7 +154,6 @@ async fn serve_session(session: HostSession) {
             println!("共注入 {injected} 个输入事件（{dropped} 个被系统拒绝）");
         }
     }
-    let _ = capture_thread.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +260,10 @@ impl GraphicsCaptureApiHandler for ServeCapture {
     }
 }
 
-/// 捕获线程入口：tx 经 Settings 的 Flags 通道注入 handler。
-fn run_capture(tx: mpsc::UnboundedSender<VideoFrame>) {
+/// 启动捕获（自由线程）：返回外部控制句柄，会话结束用 `stop()` 主动回收。
+fn start_capture(
+    tx: mpsc::UnboundedSender<VideoFrame>,
+) -> windows_capture::capture::CaptureControl<ServeCapture, Box<dyn std::error::Error + Send + Sync>> {
     let monitor = windows_capture::monitor::Monitor::primary().expect("主显示器");
     let settings = Settings::new(
         monitor,
@@ -276,7 +275,5 @@ fn run_capture(tx: mpsc::UnboundedSender<VideoFrame>) {
         ColorFormat::Bgra8,
         tx,
     );
-    if let Err(e) = ServeCapture::start(settings) {
-        eprintln!("[capture] 捕获失败: {e}");
-    }
+    ServeCapture::start_free_threaded(settings).expect("捕获启动失败")
 }
