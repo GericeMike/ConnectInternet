@@ -73,7 +73,7 @@ impl StreamApp {
             slot: Arc::new(Mutex::new(None)),
             host_size: Arc::new(Mutex::new((0, 0))),
             input_tx: None,
-            fullscreen: true,
+            fullscreen: false,
             rendered: 0,
             last_title: Instant::now(),
             title_frames: 0,
@@ -237,14 +237,15 @@ impl ApplicationHandler for StreamApp {
         if self.window.is_some() {
             return;
         }
+        // 默认带边框窗口（最小化/最大化/关闭按钮齐全），F11 切全屏
         let attrs = Window::default_attributes()
             .with_title("rdlink client（连接中…）")
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("窗口创建失败"));
         let mut display = Display::new(window.clone(), false);
 
-        println!("渲染就绪，连接 {} …（Esc 退出 / F11 切全屏）", self.addr);
-        println!("连接后全屏显示 host 画面 —— 本机自闭环时会看到无限镜像（预期效果）");
+        println!("渲染就绪，连接 {} …（窗口模式 | F11 切全屏 | Esc 退出）", self.addr);
 
         self.connect_started = Some(Instant::now());
         let (input_tx, input_rx) = mpsc::unbounded_channel();
