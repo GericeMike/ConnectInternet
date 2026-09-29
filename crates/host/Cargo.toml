@@ -1,0 +1,14 @@
+[package]
+name = "rdlink-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "host"
+path = "src/main.rs"
+
+[dependencies]
+rdlink-proto = { path = "../proto" }
+ffmpeg-the-third = "6"
+# T3/T8 将加入: windows-capture, windows, rdlink-transport

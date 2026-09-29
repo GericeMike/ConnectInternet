@@ -1,0 +1,6 @@
+# vendored FFmpeg（BtbN win64 gpl shared）
+# relative = true：相对「cargo 调用目录」解析为绝对路径，须在仓库根目录执行 cargo
+[env]
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }
+# bindgen 需要 libclang（LLVM 默认安装路径）
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

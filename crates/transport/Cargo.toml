@@ -1,0 +1,8 @@
+[package]
+name = "rdlink-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# T2 将加入: quinn, rustls, rcgen, tokio, rdlink-proto

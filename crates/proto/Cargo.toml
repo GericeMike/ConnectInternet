@@ -1,0 +1,8 @@
+[package]
+name = "rdlink-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# T1 将加入: serde, bincode

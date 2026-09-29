@@ -1,0 +1,13 @@
+[package]
+name = "rdlink-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+rdlink-proto = { path = "../proto" }
+# T5/T6/T8 将加入: ffmpeg-the-third, winit, wgpu, rdlink-transport

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/transport",
+    "crates/host",
+    "crates/client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"

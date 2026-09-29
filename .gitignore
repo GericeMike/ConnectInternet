@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# vendored ffmpeg (90MB+, fetch per README)
+third_party/ffmpeg/
+
+# runtime artifacts
+certs/
+*.h264
+*.png
+
+# local configs containing machine-specific info
+config.local.toml
