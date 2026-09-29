@@ -1,6 +1,7 @@
 //! rdlink 被控端：屏幕捕获 → NVENC 编码 → QUIC 发送；接收输入事件并注入。
 
 mod capture_demo;
+mod encode_demo;
 
 use ffmpeg_the_third as ffmpeg;
 
@@ -9,11 +10,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("--check") => check(),
         Some("--capture-demo") => capture_demo::run(),
+        Some("--encode-demo") => encode_demo::run(),
         Some("--list-monitors") => capture_demo::list_monitors(),
-        Some("--encode-demo") => {
-            eprintln!("encode-demo: 尚未实现（T4 交付：NVENC 编码落盘 demo）");
-            std::process::exit(2);
-        }
         _ => {
             println!("rdlink-host {} (被控端)", env!("CARGO_PKG_VERSION"));
             println!("协议版本: {}", rdlink_proto::PROTOCOL_VERSION);
