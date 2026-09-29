@@ -11,9 +11,22 @@ use ffmpeg::format::Pixel;
 use ffmpeg::frame::Video;
 use ffmpeg::software::scaling::{Context as Scaler, Flags as ScaleFlags};
 
-/// M1 固定参数档(docs/M1-任务拆解.md T4):CBR 50Mbps,gop 250,无 B 帧
-pub const BITRATE: usize = 50_000_000;
-pub const GOP: u32 = 250;
+/// M1 默认参数档（T10 起可用环境变量覆盖做参数扫描）：
+///   RDLINK_BITRATE_MBPS（默认 50）、RDLINK_GOP（默认 90，缩短关键帧间隔利于丢帧后快速恢复）
+/// CBR，无 B 帧。
+pub fn bitrate() -> usize {
+    std::env::var("RDLINK_BITRATE_MBPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mbps| mbps * 1_000_000)
+        .unwrap_or(50_000_000)
+}
+pub fn gop() -> u32 {
+    std::env::var("RDLINK_GOP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(90)
+}
 
 /// Windows CRT 的 EAGAIN(Error::Other 存 AVUNERROR 后的正值)
 const POSIX_EAGAIN: i32 = 11;
@@ -112,8 +125,8 @@ impl NvencEncoder {
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::BGRZ); // BGR0:NVENC 原生支持,内部转 NV12
-        ctx.set_bit_rate(BITRATE);
-        ctx.set_gop(GOP);
+        ctx.set_bit_rate(bitrate());
+        ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒
         // 名义 60fps:码率控制按 1/60s 每帧预算分配(串流标准做法)。
@@ -168,8 +181,8 @@ impl QsvEncoder {
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::NV12); // QSV 只吃 nv12,swscale 转换
-        ctx.set_bit_rate(BITRATE);
-        ctx.set_gop(GOP);
+        ctx.set_bit_rate(bitrate());
+        ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒
         ctx.set_frame_rate(Some((60, 1))); // 码率控制的每帧预算基准(同 x264 坑)
@@ -238,8 +251,8 @@ impl X264Encoder {
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::YUV420P); // x264 不吃 bgr0,swscale 转换
-        ctx.set_bit_rate(BITRATE);
-        ctx.set_gop(GOP);
+        ctx.set_bit_rate(bitrate());
+        ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒
         ctx.set_frame_rate(Some((60, 1))); // 同 NVENC:码率控制的每帧预算基准

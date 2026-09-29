@@ -67,8 +67,8 @@ impl GraphicsCaptureApiHandler for CaptureDemo {
                 println!(
                     "[demo] 编码器: {}{tier_label} @ {width}x{height},CBR {}Mbps gop {}",
                     enc.name(),
-                    encoder::BITRATE / 1_000_000,
-                    encoder::GOP,
+                    encoder::bitrate() / 1_000_000,
+                    encoder::gop(),
                 );
                 let out = std::fs::File::create("capture/out.h264")?;
                 (ENCODE_DURATION, Some(encoder::SendEncoder(enc)), Some(out))

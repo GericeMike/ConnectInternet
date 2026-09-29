@@ -80,8 +80,11 @@ async fn serve_session(session: HostSession) {
     // 会话日志已在上层打印 peer_name；此处仅持有供未来按主控端区分策略用
     let _ = &peer_name;
 
-    // 捕获线程 → channel → 发送任务
-    let (tx, mut rx) = mpsc::unbounded_channel::<VideoFrame>();
+    // 捕获线程 → channel → 发送任务。
+    // 有界通道（容量 4）+ 捕获侧 try_send：发送跟不上时丢新帧保低延迟（T10 背压兜底）——
+    // 视频流不能丢中间帧（破坏参考链），丢"整帧不入队"是流媒体标准做法；
+    // gop 已缩到 90，丢帧后 ≤3s 内必有 IDR 恢复。
+    let (tx, mut rx) = mpsc::channel::<VideoFrame>(4);
 
     // free-threaded 启动：拿到 CaptureControl，会话结束后可从外部主动停止
     // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
@@ -231,12 +234,14 @@ use windows_capture::settings::{
 
 struct ServeCapture {
     enc: SendEncoder,
-    tx: mpsc::UnboundedSender<VideoFrame>,
+    tx: mpsc::Sender<VideoFrame>,
     /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     start: Instant,
     /// 本统计窗口内的帧数（5s 重置，算窗口 fps）
     window_frames: u64,
+    /// 背压丢帧计数（T10）
+    dropped: u64,
     encoded: u64,
     /// 本窗口编码耗时样本（µs，报告后清空）
     enc_us: Vec<u64>,
@@ -249,7 +254,7 @@ struct ServeCapture {
 impl GraphicsCaptureApiHandler for ServeCapture {
     /// Flags：出口通道 + 就绪信号 + 队列深度计数（经 Settings 注入）
     type Flags = (
-        mpsc::UnboundedSender<VideoFrame>,
+        mpsc::Sender<VideoFrame>,
         std::sync::mpsc::Sender<()>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     );
@@ -275,6 +280,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             backlog,
             start: Instant::now(),
             window_frames: 0,
+            dropped: 0,
             encoded: 0,
             enc_us: Vec::new(),
             last_report: Instant::now(),
@@ -301,22 +307,25 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             let enc_us = e as u32; // 随帧下发（协议 v2，client 侧分段打点）
             for p in packets {
                 self.encoded += 1;
-                if self
-                    .tx
-                    .send(VideoFrame {
-                        capture_pts_us: p.pts_us,
-                        key: p.key,
-                        encode_us: enc_us,
-                        data: p.data,
-                    })
-                    .is_err()
-                {
-                    // 发送端已关闭（会话结束）→ 停止捕获
-                    ctrl.stop();
-                    return Ok(());
+                match self.tx.try_send(VideoFrame {
+                    capture_pts_us: p.pts_us,
+                    key: p.key,
+                    encode_us: enc_us,
+                    data: p.data,
+                }) {
+                    Ok(()) => {
+                        self.backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // 背压兜底（T10）：发送跟不上 → 整帧丢弃（不破坏参考链）
+                        self.dropped += 1;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // 发送端已关闭（会话结束）→ 停止捕获
+                        ctrl.stop();
+                        return Ok(());
+                    }
                 }
-                self.backlog
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -325,12 +334,13 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             let window_s = self.last_report.elapsed().as_secs_f32();
             let (p50, p95) = pct2(&mut self.enc_us, 0.50, 0.95);
             println!(
-                "[stats] {:.1}s: {:.1}fps | 编码 p50={:.1}ms p95={:.1}ms | 待发队列 {} | 累计 {} 包（{}）",
+                "[stats] {:.1}s: {:.1}fps | 编码 p50={:.1}ms p95={:.1}ms | 待发队列 {} | 丢帧 {} | 累计 {} 包（{}）",
                 self.start.elapsed().as_secs_f32(),
                 self.window_frames as f32 / window_s,
                 p50 as f64 / 1000.0,
                 p95 as f64 / 1000.0,
                 self.backlog.load(std::sync::atomic::Ordering::Relaxed),
+                self.dropped,
                 self.encoded,
                 self.enc_name,
             );
@@ -367,7 +377,7 @@ fn nudge_cursor() {
 
 /// 启动捕获（自由线程）：返回外部控制句柄，会话结束用 `stop()` 主动回收。
 fn start_capture(
-    tx: mpsc::UnboundedSender<VideoFrame>,
+    tx: mpsc::Sender<VideoFrame>,
     ready: std::sync::mpsc::Sender<()>,
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> windows_capture::capture::CaptureControl<ServeCapture, Box<dyn std::error::Error + Send + Sync>> {
