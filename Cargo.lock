@@ -1893,6 +1893,7 @@ version = "0.1.0"
 dependencies = [
  "ffmpeg-the-third",
  "rdlink-proto",
+ "windows",
  "windows-capture",
 ]
 
