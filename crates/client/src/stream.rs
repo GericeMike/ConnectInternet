@@ -9,20 +9,25 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tokio::sync::mpsc;
+
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use rdlink_proto::{ControlMsg, Message};
+use rdlink_proto::{ControlMsg, InputEvent, Message};
 use rdlink_transport::{connect, read_frame, write_frame};
 
 use crate::decoder::StreamDecoder;
 use crate::display::Display;
+use crate::input_map::vk_from_key;
 
 /// 生产者-渲染共享帧槽（最新帧优先：生产者覆盖，渲染者取走）。
 type FrameSlot = Arc<Mutex<Option<FrameBuf>>>;
+/// host 画面分辨率（连接后由收流线程写入，输入坐标映射用）
+type HostSize = Arc<Mutex<(u32, u32)>>;
 
 struct FrameBuf {
     bgra: Vec<u8>,
@@ -45,6 +50,9 @@ struct StreamApp {
     window: Option<Arc<Window>>,
     display: Option<Display>,
     slot: FrameSlot,
+    host_size: HostSize,
+    /// 输入事件出口（winit 主线程 → 收流线程的发送任务）
+    input_tx: Option<mpsc::UnboundedSender<InputEvent>>,
     fullscreen: bool,
     // 渲染统计
     rendered: u64,
@@ -63,6 +71,8 @@ impl StreamApp {
             window: None,
             display: None,
             slot: Arc::new(Mutex::new(None)),
+            host_size: Arc::new(Mutex::new((0, 0))),
+            input_tx: None,
             fullscreen: true,
             rendered: 0,
             last_title: Instant::now(),
@@ -72,10 +82,21 @@ impl StreamApp {
         }
     }
 
-    fn spawn_stream_thread(&self, window: Arc<Window>) {
+    fn forward_input(&self, ev: InputEvent) {
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(ev); // 通道关闭（会话已断）时静默丢弃
+        }
+    }
+
+    fn spawn_stream_thread(
+        &self,
+        window: Arc<Window>,
+        input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    ) {
         let addr = self.addr.clone();
         let pin = self.pin.clone();
         let slot = self.slot.clone();
+        let host_size = self.host_size.clone();
         std::thread::Builder::new()
             .name("rdlink-stream".into())
             .spawn(move || {
@@ -83,18 +104,20 @@ impl StreamApp {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(stream_loop(addr, pin, slot, window));
+                rt.block_on(stream_loop(addr, pin, slot, host_size, window, input_rx));
             })
             .expect("收流线程创建失败");
     }
 }
 
-/// 收流+解码循环（工作线程）。
+/// 收流+解码循环（工作线程）。同时跑两个任务：视频收流解码、输入事件发送。
 async fn stream_loop(
     addr: String,
     pin: String,
     slot: FrameSlot,
+    host_size: HostSize,
     window: Arc<Window>,
+    mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
 ) {
     let t0 = Instant::now();
     let session = match connect(
@@ -115,11 +138,35 @@ async fn stream_loop(
         session.peer_name,
         t0.elapsed()
     );
-    if let ControlMsg::VideoStreamInfo { width, height, .. } = &session.video_info {
+
+    // 解构会话：input 流交给发送任务，video 留在本循环
+    let rdlink_transport::ClientSession {
+        peer_name: _,
+        video_info,
+        mut control_send,
+        control_recv: _,
+        mut video,
+        mut input,
+    } = session;
+
+    // 记录 host 分辨率（输入坐标映射用）
+    if let ControlMsg::VideoStreamInfo { width, height, .. } = &video_info {
         println!("视频参数: {width}x{height}");
+        *host_size.lock().unwrap() = (*width, *height);
     }
 
-    let mut session = session;
+    // 输入发送任务：winit 主线程 → input_rx → Input 流
+    let input_task = tokio::spawn(async move {
+        let mut sent = 0u64;
+        while let Some(ev) = input_rx.recv().await {
+            if write_frame(&mut input, &Message::Input(ev)).await.is_err() {
+                break; // host 断开
+            }
+            sent += 1;
+        }
+        sent
+    });
+
     let mut decoder = match StreamDecoder::new() {
         Ok(d) => d,
         Err(e) => {
@@ -131,7 +178,7 @@ async fn stream_loop(
     let mut skipped_before_idr = 0u64;
     let mut decode_buf: Vec<u8> = Vec::new();
 
-    while let Some(msg) = read_frame(&mut session.video).await.transpose() {
+    while let Some(msg) = read_frame(&mut video).await.transpose() {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -178,11 +225,11 @@ async fn stream_loop(
 
     // 干净退出：通知 host
     let _ = write_frame(
-        &mut session.control_send,
+        &mut control_send,
         &Message::Control(ControlMsg::Bye { reason: "client 退出".into() }),
     )
     .await;
-    println!("video 流结束（共解码 {} 帧）", decoder.frames);
+    println!("video 流结束（共解码 {} 帧，输入事件已发 {} 条）", decoder.frames, input_task.await.unwrap_or(0));
 }
 
 impl ApplicationHandler for StreamApp {
@@ -200,7 +247,9 @@ impl ApplicationHandler for StreamApp {
         println!("连接后全屏显示 host 画面 —— 本机自闭环时会看到无限镜像（预期效果）");
 
         self.connect_started = Some(Instant::now());
-        self.spawn_stream_thread(window.clone());
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        self.input_tx = Some(input_tx);
+        self.spawn_stream_thread(window.clone(), input_rx);
         display.render();
         self.display = Some(display);
         self.window = Some(window);
@@ -218,7 +267,9 @@ impl ApplicationHandler for StreamApp {
                 }
             }
 
+            // ---------- T8 输入捕获（本地热键先拦截，其余转发 host） ----------
             WindowEvent::KeyboardInput { event, .. } => {
+                // 本地热键
                 if event.state == ElementState::Pressed {
                     match event.logical_key {
                         Key::Named(NamedKey::Escape) => event_loop.exit(),
@@ -229,9 +280,61 @@ impl ApplicationHandler for StreamApp {
                             } else {
                                 window.set_fullscreen(None);
                             }
+                            return;
                         }
                         _ => {}
                     }
+                }
+                // 转发（物理键 → VK）
+                if let Some(vk) = vk_from_key(event.physical_key) {
+                    self.forward_input(InputEvent::Key {
+                        vk,
+                        down: event.state == ElementState::Pressed,
+                    });
+                }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                // 窗口物理坐标 → 归一化 → host 屏幕像素
+                let inner = window.inner_size();
+                if inner.width > 0 && inner.height > 0 {
+                    let (hw, hh) = *self.host_size.lock().unwrap();
+                    if hw > 0 && hh > 0 {
+                        let x = ((position.x / inner.width as f64) * hw as f64) as u32;
+                        let y = ((position.y / inner.height as f64) * hh as f64) as u32;
+                        self.forward_input(InputEvent::MouseMove {
+                            x: x.min(hw - 1),
+                            y: y.min(hh - 1),
+                        });
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let b = match button {
+                    MouseButton::Left => rdlink_proto::MouseButton::Left,
+                    MouseButton::Right => rdlink_proto::MouseButton::Right,
+                    MouseButton::Middle => rdlink_proto::MouseButton::Middle,
+                    MouseButton::Back => rdlink_proto::MouseButton::X1,
+                    MouseButton::Forward => rdlink_proto::MouseButton::X2,
+                    _ => return,
+                };
+                self.forward_input(InputEvent::MouseButton {
+                    button: b,
+                    down: state == ElementState::Pressed,
+                });
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // LineDelta 单位 = 滚轮格；PixelDelta（精密触控板）按 ~53px/格折算
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as i32, y as i32),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        ((p.x / 53.0) as i32, (p.y / 53.0) as i32)
+                    }
+                };
+                if dx != 0 || dy != 0 {
+                    self.forward_input(InputEvent::MouseWheel { dx, dy });
                 }
             }
 

@@ -3,6 +3,7 @@
 mod decode_demo;
 mod decoder;
 mod display;
+mod input_map;
 mod render_demo;
 mod stream;
 
