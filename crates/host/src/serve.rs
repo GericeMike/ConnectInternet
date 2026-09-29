@@ -77,33 +77,6 @@ async fn serve_session(session: HostSession) {
             .expect("捕获线程创建失败")
     };
 
-    // T8：输入注入任务——消费 Input 流 → SendInput（被控端 input.rs）
-    {
-        let mut input = input;
-        let peer = peer_name.clone();
-        tokio::spawn(async move {
-            let mut injected = 0u64;
-            let mut first_logged = false;
-            while let Some(msg) = read_frame(&mut input).await.transpose() {
-                match msg {
-                    Ok(Message::Input(ev)) => {
-                        if !first_logged {
-                            println!("[input] 首条输入事件到达（来自 {peer}）");
-                            first_logged = true;
-                        }
-                        // UIPI（焦点在提权窗口）会失败，计数但不刷屏
-                        if crate::input::inject(&ev).is_ok() {
-                            injected += 1;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            println!("[input] 流结束，共注入 {injected} 条");
-        });
-    }
-
     // 发送任务：拥有 video 流；channel 关闭或写失败即结束
     let video_task = tokio::spawn(async move {
         let mut video = video;
