@@ -11,3 +11,6 @@ certs/
 
 # local configs containing machine-specific info
 config.local.toml
+
+# tool internal state
+.mimosa/
