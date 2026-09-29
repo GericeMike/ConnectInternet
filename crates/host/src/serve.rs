@@ -63,7 +63,7 @@ async fn serve_session(session: HostSession) {
         mut control_send,
         mut control_recv,
         video,
-        input: _input,
+        input,
     } = session;
     let _ = peer_name;
 
@@ -94,6 +94,31 @@ async fn serve_session(session: HostSession) {
         sent
     });
 
+    // 输入注入任务（T8）：Input 流 → SendInput。
+    // SendInput 单次 <1ms,直接在异步任务里调用(M1);UIPI(焦点在提权窗口)时注入被系统丢弃并计数。
+    let input_task = tokio::spawn(async move {
+        let mut input = input;
+        let mut injected = 0u64;
+        let mut dropped = 0u64;
+        while let Ok(Some(msg)) = read_frame(&mut input).await {
+            if let Message::Input(event) = msg {
+                match crate::input::inject(&event) {
+                    Ok(()) => injected += 1,
+                    Err(e) => {
+                        dropped += 1;
+                        if dropped <= 3 {
+                            eprintln!("[input] 注入失败(UIPI?): {e}");
+                        }
+                    }
+                }
+                if injected > 0 && injected % 100 == 0 {
+                    println!("[input] 已注入 {injected} 个事件");
+                }
+            }
+        }
+        (injected, dropped)
+    });
+
     // Control 通道：Ping→Pong / Bye / 断开检测
     loop {
         match read_frame(&mut control_recv).await {
@@ -122,6 +147,13 @@ async fn serve_session(session: HostSession) {
     drop(control_recv);
     if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_secs(10), video_task).await {
         println!("共发送 {} 帧视频", sent.unwrap_or(0));
+    }
+    if let Ok(Ok((injected, dropped))) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), input_task).await
+    {
+        if injected > 0 || dropped > 0 {
+            println!("共注入 {injected} 个输入事件（{dropped} 个被系统拒绝）");
+        }
     }
     let _ = capture_thread.join();
 }
