@@ -65,6 +65,8 @@ async fn serve_session(session: HostSession) {
         video,
         input,
     } = session;
+    // 会话日志已在上层打印 peer_name；此处仅持有供未来按主控端区分策略用
+    let _ = &peer_name;
 
     // 捕获线程 → channel → 发送任务
     let (tx, mut rx) = mpsc::unbounded_channel::<VideoFrame>();
