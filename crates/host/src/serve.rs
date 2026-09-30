@@ -21,6 +21,10 @@ use crate::encoder::{self, SendEncoder};
 pub struct HostConf {
     pub port: Option<u16>,
     pub cert_dir: Option<String>,
+    /// GPU 着色器 NV12 转换（T3a）。独显收益巨大；弱核显（如 UHD 620）上可能与
+    /// QSV 编码抢同一块 GPU 和共享内存带宽，导致 fps 下降——此时可关掉回退
+    /// BGRA 直读 + swscale 旧路径。默认 true。
+    pub gpu_convert: Option<bool>,
 }
 
 pub fn load_conf() -> HostConf {
@@ -401,7 +405,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             tx,
             backlog,
             gpu: None,
-            gpu_dead: false,
+            gpu_dead: !load_conf().gpu_convert.unwrap_or(true),
             start: Instant::now(),
             window_frames: 0,
             dropped: 0,

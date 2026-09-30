@@ -118,6 +118,7 @@ fn box_wh(w: u32, h: u32) -> D3D11_BOX {
 }
 
 pub struct GpuConverter {
+    device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
@@ -139,6 +140,8 @@ pub struct GpuConverter {
     /// 回读暂存（pitch 对齐后 Y+UV 全量），复用避免每帧分配
     scratch: Vec<u8>,
     pitch: usize,
+    /// WGC 帧纹理可直接建 SRV（省掉每帧 8MB 中间拷贝；不支持则走 CopyResource 中转）
+    frame_srv_ok: bool,
 }
 
 impl GpuConverter {
@@ -223,6 +226,7 @@ impl GpuConverter {
         };
 
         Ok(Self {
+            device: device.clone(),
             ctx,
             vs,
             ps_y,
@@ -241,6 +245,7 @@ impl GpuConverter {
             h,
             scratch: Vec::new(),
             pitch: 0,
+            frame_srv_ok: true,
         })
     }
 
@@ -251,13 +256,34 @@ impl GpuConverter {
             // 图元拓扑：默认 UNDEFINED 下 Draw 无效；关剔除：默认 CullBack 会剔掉 CCW 全屏三角形
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.RSSetState(&self.rs);
-            // 1) 帧纹理 → 自有 BGRA（保证可建 SRV）
-            ctx.CopyResource(&self.bgra_tex, frame_tex);
+            // 1) 源 SRV：优先直接用 WGC 帧纹理（弱核显上每帧 8MB 中转拷贝是流量大头，
+            //    能省则省）；帧纹理不带 SHADER_RESOURCE 绑定时回退自有 BGRA 中转
+            let srv: ID3D11ShaderResourceView = if self.frame_srv_ok {
+                let mut s: Option<ID3D11ShaderResourceView> = None;
+                match self.device.CreateShaderResourceView(frame_tex, None, Some(&mut s as *mut _)) {
+                    Ok(()) => match s {
+                        Some(srv) => srv,
+                        None => {
+                            self.frame_srv_ok = false;
+                            ctx.CopyResource(&self.bgra_tex, frame_tex);
+                            self.bgra_srv.clone()
+                        }
+                    },
+                    Err(_) => {
+                        self.frame_srv_ok = false;
+                        ctx.CopyResource(&self.bgra_tex, frame_tex);
+                        self.bgra_srv.clone()
+                    }
+                }
+            } else {
+                ctx.CopyResource(&self.bgra_tex, frame_tex);
+                self.bgra_srv.clone()
+            };
 
             // 2) Y pass：全分辨率
             ctx.VSSetShader(&self.vs, None);
             ctx.PSSetShader(&self.ps_y, None);
-            ctx.PSSetShaderResources(0, Some(&[Some(self.bgra_srv.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(srv)]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.OMSetRenderTargets(Some(&[Some(self.y_rtv.clone())]), None);
             ctx.RSSetViewports(Some(&[viewport(self.w, self.h)]));
