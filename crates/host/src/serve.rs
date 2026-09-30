@@ -28,12 +28,31 @@ pub struct HostConf {
 }
 
 pub fn load_conf() -> HostConf {
-    std::fs::read_to_string("rdlink.toml")
+    let mut conf: HostConf = std::fs::read_to_string("rdlink.toml")
         .ok()
         .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
         .and_then(|v| v.get("host").cloned())
         .and_then(|h| h.try_into::<HostConf>().ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 本机覆盖（rdlink.local.toml，git 忽略）：如被控端弱核显关 gpu_convert，
+    // 不改入库配置就能按机器调参
+    if let Some(lc) = std::fs::read_to_string("rdlink.local.toml")
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+        .and_then(|v| v.get("host").cloned())
+        .and_then(|h| h.try_into::<HostConf>().ok())
+    {
+        if lc.port.is_some() {
+            conf.port = lc.port;
+        }
+        if lc.cert_dir.is_some() {
+            conf.cert_dir = lc.cert_dir;
+        }
+        if lc.gpu_convert.is_some() {
+            conf.gpu_convert = lc.gpu_convert;
+        }
+    }
+    conf
 }
 
 /// host 进程级时钟原点：VideoFrame.pts 与 Pong 时戳共用同一时钟域（对时前提）
