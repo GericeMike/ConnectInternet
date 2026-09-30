@@ -235,6 +235,10 @@ impl VideoEncoder for NvencEncoder {
         if self.force {
             self.nv12_frame.set_kind(picture::Type::I);
             self.force = false;
+        } else {
+            // 帧对象跨帧复用：不复位 pict_type 会把上一帧的 I 粘到这一帧
+            // （症状：缓存复用会话全帧 IDR，被控端长稳测试抓获）
+            self.nv12_frame.set_kind(picture::Type::None);
         }
         self.encoder.send_frame(&self.nv12_frame)?;
         drain(&mut self.encoder, &mut self.packet)
@@ -363,6 +367,9 @@ impl VideoEncoder for QsvEncoder {
             // 注意：set_kind 要设在真正喂给编码器的 nv12 帧上（swscale 不保证传递 pict_type）
             self.nv12_frame.set_kind(picture::Type::I);
             self.force = false;
+        } else {
+            // 帧对象跨帧复用：不复位 pict_type 会把上一帧的 I 粘到这一帧（同 NVENC 注）
+            self.nv12_frame.set_kind(picture::Type::None);
         }
         self.encoder.send_frame(&self.nv12_frame)?;
         let out = drain(&mut self.encoder, &mut self.packet)?;
@@ -460,6 +467,9 @@ impl VideoEncoder for X264Encoder {
             // b=0(zerolatency)时强制 I 即 IDR,x264 默认每个 IDR 前重发 SPS/PPS
             out_frame.set_kind(picture::Type::I);
             self.force = false;
+        } else {
+            // 帧对象跨帧复用：不复位 pict_type 会把上一帧的 I 粘到这一帧（同 NVENC 注）
+            out_frame.set_kind(picture::Type::None);
         }
         self.encoder.send_frame(out_frame)?;
         drain(&mut self.encoder, &mut self.packet)
