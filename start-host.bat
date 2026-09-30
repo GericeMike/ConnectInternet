@@ -1,6 +1,9 @@
 @echo off
-rem host 启动脚本：必须在交互式桌面会话运行（WGC 捕获要求，坑位 32）。
-rem 用法（本机双击或计划任务调用）：cd 到仓库根目录后执行本脚本。
+rem rdlink host launcher.
+rem MUST run in an interactive desktop session (WGC capture requirement, pitfall 32).
+rem Usage: run this bat from repo root (double-click or via scheduled task).
+rem NOTE: keep this file ASCII-only -- cmd parses bat in ANSI codepage (GBK),
+rem       UTF-8 Chinese comments get mojibake'd and executed as commands.
 cd /d "%~dp0"
 set PATH=%~dp0third_party\ffmpeg\bin;%PATH%
 target\release\host.exe >> host-run.log 2>&1
