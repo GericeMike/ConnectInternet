@@ -101,6 +101,8 @@ async fn async_main() {
     let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     // 抢占信号：新主控端接入时通知当前会话提前回收（不等 idle timeout 的 10s）
     let (preempt_tx, preempt_rx) = tokio::sync::watch::channel(false);
+    // M3-1 剪贴板同步：进程级双线程（监听/写入），会话只拿通道
+    let clip = crate::clipboard::spawn();
 
     loop {
         // 每个会话重新取主显示器（分辨率可能在会话间变化）
@@ -121,10 +123,12 @@ async fn async_main() {
         let gate = gate.clone();
         let preempt_tx = preempt_tx.clone();
         let preempt = preempt_rx.clone();
+        let clip_rx = clip.changes.clone();
+        let clip_tx = clip.write_tx.clone();
         tokio::spawn(async move {
             let _permit = gate.lock().await; // 前一会话占用捕获时，本会话在此等待
             let _ = preempt_tx.send(false); // 自己上岗后复位信号（供再下一个会话抢占）
-            serve_session_inner(session, preempt).await;
+            serve_session_inner(session, preempt, clip_rx, clip_tx).await;
             println!("会话结束，等待下一个主控端…");
         });
     }
@@ -134,6 +138,8 @@ async fn async_main() {
 async fn serve_session_inner(
     session: HostSession,
     mut preempt: tokio::sync::watch::Receiver<bool>,
+    mut clip_rx: tokio::sync::watch::Receiver<(u64, String)>,
+    clip_tx: std::sync::mpsc::Sender<(u64, String)>,
 ) {
     let HostSession {
         peer_name,
@@ -301,6 +307,21 @@ async fn serve_session_inner(
                 }
                 continue;
             }
+            _ = clip_rx.changed() => {
+                // M3-1：本端剪贴板变化 → 同步给 client（空文本是初始值，跳过）
+                let (hash, text) = clip_rx.borrow().clone();
+                if !text.is_empty() {
+                    let r = write_frame(
+                        &mut control_send,
+                        &Message::Control(ControlMsg::ClipboardSync { hash, text }),
+                    )
+                    .await;
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
             _ = tokio::time::sleep_until(last_ping + std::time::Duration::from_secs(3)) => {
                 println!("主控端失联（3s 无 Ping），回收会话");
                 break;
@@ -326,6 +347,12 @@ async fn serve_session_inner(
             Ok(Some(Message::Control(ControlMsg::Bye { reason }))) => {
                 println!("主控端主动断开: {reason}");
                 break;
+            }
+            Ok(Some(Message::Control(ControlMsg::ClipboardSync { hash, text }))) => {
+                // M3-1：对端剪贴板 → 交写线程落本机（防回环由 LAST_SYNCED 统一裁决）
+                if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
+                    let _ = clip_tx.send((hash, text));
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) => {

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 rdlink-proto = { path = "../proto" }
 rdlink-transport = { path = "../transport" }
+arboard = "3"
 ffmpeg-the-third = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 winit = "0.30"

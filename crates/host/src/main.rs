@@ -1,6 +1,7 @@
 //! rdlink 被控端：屏幕捕获 → 编码 → QUIC 发送；接收输入事件并注入。
 
 mod capture;
+mod clipboard;
 mod encoder;
 mod gpu;
 mod input;

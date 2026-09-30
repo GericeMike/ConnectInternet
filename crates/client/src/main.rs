@@ -1,5 +1,6 @@
 //! rdlink 主控端：QUIC 收流 → 解码 → wgpu 渲染；捕获键鼠发往被控端。
 
+mod clipboard;
 mod decode_demo;
 mod decoder;
 mod display;

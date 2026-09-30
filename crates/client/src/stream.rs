@@ -203,6 +203,8 @@ async fn stream_loop(
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut attempt: u64 = 0;
+    // M3-1 剪贴板：进程级 poll/write 双线程，会话只拿通道
+    let clip = crate::clipboard::spawn();
     loop {
         // 重连退避：1s→2s→4s→8s→10s 封顶（首次连接不等待）
         if attempt > 0 {
@@ -235,7 +237,8 @@ async fn stream_loop(
         *input_tx_slot.lock().unwrap() = Some(input_tx);
 
         match session_run(
-            session, input_rx, slot.clone(), host_size.clone(), ui.clone(), window.clone(), &mut shutdown_rx,
+            session, input_rx, slot.clone(), host_size.clone(), ui.clone(), window.clone(),
+            clip.changes.clone(), clip.write_tx.clone(), &mut shutdown_rx,
         )
         .await
         {
@@ -251,7 +254,8 @@ async fn stream_loop(
     }
 }
 
-/// 单个会话：对时 + 视频收流解码 + 输入转发，直到断线或用户退出。
+/// 单个会话：对时 + 视频收流解码 + 输入转发 + 剪贴板同步，直到断线或用户退出。
+#[allow(clippy::too_many_arguments)]
 async fn session_run(
     session: rdlink_transport::ClientSession,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
@@ -259,6 +263,8 @@ async fn session_run(
     host_size: HostSize,
     ui: Arc<UiStats>,
     window: Arc<Window>,
+    mut clip_rx: tokio::sync::watch::Receiver<(u64, String)>,
+    clip_tx: std::sync::mpsc::Sender<(u64, String)>,
     shutdown: &mut mpsc::Receiver<()>,
 ) -> SessionExit {
     let rdlink_transport::ClientSession {
@@ -330,6 +336,20 @@ async fn session_run(
                         .await;
                         break;
                     }
+                    // M3-1：本端剪贴板变化 → 同步给 host（空文本是初始值，跳过）
+                    _ = clip_rx.changed() => {
+                        let (hash, text) = clip_rx.borrow().clone();
+                        if !text.is_empty()
+                            && write_frame(
+                                &mut control_send,
+                                &Message::Control(ControlMsg::ClipboardSync { hash, text }),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -375,7 +395,15 @@ async fn session_run(
                 break;
             }
         };
-        let Message::VideoFrame(f) = msg else { continue };
+        let Message::VideoFrame(f) = msg else {
+            // M3-1：对端剪贴板 → 交写线程落本机（防回环由 LAST_SYNCED 统一裁决）
+            if let Message::Control(ControlMsg::ClipboardSync { hash, text }) = msg {
+                if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
+                    let _ = clip_tx.send((hash, text));
+                }
+            }
+            continue;
+        };
 
         // D4：IDR 起播
         if !got_idr {
