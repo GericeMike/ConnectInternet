@@ -348,6 +348,10 @@ struct ServeCapture {
     tx: mpsc::Sender<VideoFrame>,
     /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// T3a：GPU VideoProcessor 转换器（首个帧纹理到达时惰性初始化；
+    /// None+未死 = 还没初始化；None+死 = 初始化失败永久回退 BGRA 路径）
+    gpu: Option<crate::gpu::GpuConverter>,
+    gpu_dead: bool,
     start: Instant,
     /// 本统计窗口内的帧数（5s 重置，算窗口 fps）
     window_frames: u64,
@@ -356,6 +360,8 @@ struct ServeCapture {
     encoded: u64,
     /// 本窗口编码耗时样本（µs，报告后清空）
     enc_us: Vec<u64>,
+    /// 本窗口 GPU 转换+回读耗时样本（µs，T3a 数据）
+    gpu_us: Vec<u64>,
     last_report: Instant,
     scratch: Vec<u8>,
     /// 编码器名称（日志）
@@ -394,11 +400,14 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             enc: Some(enc),
             tx,
             backlog,
+            gpu: None,
+            gpu_dead: false,
             start: Instant::now(),
             window_frames: 0,
             dropped: 0,
             encoded: 0,
             enc_us: Vec::new(),
+            gpu_us: Vec::new(),
             last_report: Instant::now(),
             scratch: Vec::new(),
             enc_name,
@@ -419,10 +428,69 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                 ctrl.stop();
                 return Ok(());
             };
-            let fb = frame.buffer()?;
-            let bgra = fb.as_nopadding_buffer(&mut self.scratch);
-            let t0 = Instant::now();
-            let packets = enc.0.encode(bgra, w * 4, pts_us)?;
+            // T3a：优先 GPU 转换（VideoProcessor BGRA→NV12 + 3MB 回读，替代 swscale 10ms）。
+            // 转换器在首个帧纹理上惰性初始化（设备从纹理 GetDevice，保证与 WGC 同设备）；
+            // 初始化或运行失败 → 永久回退 BGRA 直读 + 编码器内 swscale 旧路径。
+            let mut t0: Option<Instant> = None;
+            let packets = {
+                let mut gpu_out: Option<Vec<encoder::EncodedPacket>> = None;
+                if !self.gpu_dead {
+                    if self.gpu.is_none() {
+                        let tex = frame.as_raw_texture();
+                        let dev = unsafe { tex.GetDevice() }.ok();
+                        let conv_result = match dev {
+                            Some(d) => crate::gpu::GpuConverter::new(
+                                &d,
+                                frame.width() as u32,
+                                frame.height() as u32,
+                            ),
+                            None => Err(windows::core::Error::from_hresult(
+                                windows::core::HRESULT(-1),
+                            )),
+                        };
+                        match conv_result {
+                            Ok(g) => {
+                                println!("[gpu] 着色器 NV12 转换器就绪（GPU 路径生效）");
+                                self.gpu = Some(g);
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ [gpu] GPU 转换器初始化失败({e}) → 回退 BGRA+swscale 旧路径");
+                                self.gpu_dead = true;
+                            }
+                        }
+                    }
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        let tex = frame.as_raw_texture();
+                        let tg = Instant::now();
+                        match gpu.convert_and_readback(tex) {
+                            Ok(nv) => {
+                                self.gpu_us.push(tg.elapsed().as_micros() as u64);
+                                t0 = Some(Instant::now());
+                                gpu_out = Some(enc.0.encode(
+                                    encoder::FrameSrc::Nv12 { buf: nv.buf, pitch: nv.pitch },
+                                    pts_us,
+                                )?);
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ [gpu] 转换/回读失败({e}) → 永久回退 BGRA+swscale 旧路径");
+                                self.gpu = None;
+                                self.gpu_dead = true;
+                            }
+                        }
+                    }
+                }
+                match gpu_out {
+                    Some(p) => p,
+                    None => {
+                        // 旧路径：WGC 直读 BGRA
+                        let fb = frame.buffer()?;
+                        let bgra = fb.as_nopadding_buffer(&mut self.scratch);
+                        t0 = Some(Instant::now());
+                        enc.0.encode(encoder::FrameSrc::Bgra { buf: bgra, pitch: w * 4 }, pts_us)?
+                    }
+                }
+            };
+            let t0 = t0.expect("编码计时起点必然被赋值");
             let e = t0.elapsed().as_micros() as u64;
             self.enc_us.push(e); // 窗口统计（p50/p95）
             let enc_us = e as u32; // 随帧下发（协议 v2，client 侧分段打点）
@@ -462,10 +530,14 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         if self.last_report.elapsed().as_secs_f32() >= 5.0 {
             let window_s = self.last_report.elapsed().as_secs_f32();
             let (p50, p95) = pct2(&mut self.enc_us, 0.50, 0.95);
+            let (g50, _) = pct2(&mut self.gpu_us, 0.50, 0.95);
+            let gpu_label = if self.gpu_us.is_empty() { "（BGRA回退）" } else { "（NV12 via GPU）" };
             println!(
-                "[stats] {:.1}s: {:.1}fps | 编码 p50={:.1}ms p95={:.1}ms | 待发队列 {} | 丢帧 {} | 累计 {} 包（{}）",
+                "[stats] {:.1}s: {:.1}fps | GPU转+读 p50={:.1}ms{} | 编码 p50={:.1}ms p95={:.1}ms | 待发队列 {} | 丢帧 {} | 累计 {} 包（{}）",
                 self.start.elapsed().as_secs_f32(),
                 self.window_frames as f32 / window_s,
+                g50 as f64 / 1000.0,
+                gpu_label,
                 p50 as f64 / 1000.0,
                 p95 as f64 / 1000.0,
                 self.backlog.load(std::sync::atomic::Ordering::Relaxed),
@@ -475,6 +547,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             );
             self.window_frames = 0;
             self.enc_us.clear();
+            self.gpu_us.clear();
             self.last_report = Instant::now();
         }
         Ok(())

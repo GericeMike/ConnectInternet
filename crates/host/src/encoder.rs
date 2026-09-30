@@ -38,12 +38,41 @@ pub struct EncodedPacket {
     pub pts_us: i64,
 }
 
+/// 编码器输入（T3a）：主路径是 GPU VideoProcessor 转好的 NV12（免 swscale）；
+/// 回退路径是 WGC 直读 BGRA（VideoProcessor 不可用时，各档内部走 swscale/内部转换）
+#[derive(Clone, Copy)]
+pub enum FrameSrc<'a> {
+    /// 连续缓冲：Y 平面（h×w）后接 UV 交错平面（h/2×w），同一行距 pitch
+    Nv12 { buf: &'a [u8], pitch: usize },
+    /// 紧凑 BGRA（pitch = 行字节数）
+    Bgra { buf: &'a [u8], pitch: usize },
+}
+
+/// NV12 拷入预分配的 Video 帧（逐行逐平面，行距可不同）
+fn copy_nv12_into_frame(frame: &mut Video, buf: &[u8], pitch: usize) {
+    // 尺寸/行距先读后借 data_mut（data_mut 可变借用期间不能再读 frame 字段）
+    let w = frame.width() as usize;
+    let h = frame.height() as usize;
+    let stride = frame.stride(0);
+    let stride1 = frame.stride(1);
+    let dst = frame.data_mut(0);
+    for y in 0..h {
+        dst[y * stride..y * stride + w].copy_from_slice(&buf[y * pitch..y * pitch + w]);
+    }
+    let uv_off = pitch * h;
+    let dst1 = frame.data_mut(1);
+    for y in 0..h / 2 {
+        dst1[y * stride1..y * stride1 + w]
+            .copy_from_slice(&buf[uv_off + y * pitch..uv_off + y * pitch + w]);
+    }
+}
+
 /// 视频编码器抽象(T7 视频链路消费)
 pub trait VideoEncoder {
     fn name(&self) -> &'static str;
     fn is_hardware(&self) -> bool;
-    /// 编码一帧 BGRA(pitch = 行字节数,数据需覆盖 pitch*(h-1)+w*4),返回 0..n 个包
-    fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error>;
+    /// 编码一帧（NV12 主路径 / BGRA 回退），返回 0..n 个包
+    fn encode(&mut self, src: FrameSrc, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error>;
     /// 流结束,冲出编码器内残留的包
     fn flush(&mut self) -> Result<Vec<EncodedPacket>, ffmpeg::Error>;
     /// 下一帧强制关键帧。编码器跨会话复用(M2-1c)时新会话首帧必须 IDR——
@@ -125,7 +154,10 @@ fn drain(encoder: &mut Encoder, packet: &mut Packet) -> Result<Vec<EncodedPacket
 
 struct NvencEncoder {
     encoder: Encoder,
-    frame: Video,
+    nv12_frame: Video,
+    bgra_frame: Video,
+    /// BGRA 回退路径的惰性 swscale（正常路径不建）
+    scaler: Option<Scaler>,
     packet: Packet,
     /// 下一帧强制 IDR（M2-1c 跨会话复用）
     force: bool,
@@ -137,7 +169,7 @@ impl NvencEncoder {
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec).encoder().video()?;
         ctx.set_width(width);
         ctx.set_height(height);
-        ctx.set_format(Pixel::BGRZ); // BGR0:NVENC 原生支持,内部转 NV12
+        ctx.set_format(Pixel::NV12); // 主路径直喂 nv12(T3a)；BGRA 回退时逐帧换 format 不可行,统一走 nv12
         ctx.set_bit_rate(bitrate());
         ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
@@ -153,7 +185,14 @@ impl NvencEncoder {
         opts.set("forced-idr", "1"); // force_key 的 I 帧必须是 IDR(带 SPS/PPS 重发)
         // open_as_with 返回 video::Encoder(已打开;Deref 链直达 send_frame/receive_packet)
         let encoder = ctx.open_as_with(codec, opts)?;
-        Ok(Self { encoder, frame: Video::new(Pixel::BGRZ, width, height), packet: Packet::empty(), force: false })
+        Ok(Self {
+            encoder,
+            nv12_frame: Video::new(Pixel::NV12, width, height),
+            bgra_frame: Video::new(Pixel::BGRZ, width, height),
+            scaler: None,
+            packet: Packet::empty(),
+            force: false,
+        })
     }
 }
 
@@ -168,14 +207,36 @@ impl VideoEncoder for NvencEncoder {
         self.force = true;
     }
 
-    fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
-        copy_bgra_into_frame(&mut self.frame, bgra, pitch);
-        self.frame.set_pts(Some(pts_us));
+    fn encode(&mut self, src: FrameSrc, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
+        // 编码器按 nv12 打开；BGRA 回退时经惰性 swscale 转 nv12（回退是异常场景，不敏感）
+        match src {
+            FrameSrc::Nv12 { buf, pitch } => {
+                copy_nv12_into_frame(&mut self.nv12_frame, buf, pitch)
+            }
+            FrameSrc::Bgra { buf, pitch } => {
+                copy_bgra_into_frame(&mut self.bgra_frame, buf, pitch);
+                if self.scaler.is_none() {
+                    self.scaler = Some(Scaler::get(
+                        Pixel::BGRZ,
+                        self.bgra_frame.width(),
+                        self.bgra_frame.height(),
+                        Pixel::NV12,
+                        self.bgra_frame.width(),
+                        self.bgra_frame.height(),
+                        ScaleFlags::FAST_BILINEAR,
+                    )?);
+                }
+                // ffmpeg-the-third 的 Scaler::run 要 &mut self
+                let scaler = self.scaler.as_mut().unwrap();
+                scaler.run(&self.bgra_frame, &mut self.nv12_frame)?;
+            }
+        }
+        self.nv12_frame.set_pts(Some(pts_us));
         if self.force {
-            self.frame.set_kind(picture::Type::I);
+            self.nv12_frame.set_kind(picture::Type::I);
             self.force = false;
         }
-        self.encoder.send_frame(&self.frame)?;
+        self.encoder.send_frame(&self.nv12_frame)?;
         drain(&mut self.encoder, &mut self.packet)
     }
 
@@ -281,13 +342,22 @@ impl VideoEncoder for QsvEncoder {
         self.force = true;
     }
 
-    fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
+    fn encode(&mut self, src: FrameSrc, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
+        // 分段计时：拷贝 / 转换（Nv12 主路径为 0）/ 提交+取包（M2-2 数据）
         let t0 = std::time::Instant::now();
-        copy_bgra_into_frame(&mut self.bgra_frame, bgra, pitch);
+        match src {
+            FrameSrc::Nv12 { buf, pitch } => copy_nv12_into_frame(&mut self.nv12_frame, buf, pitch),
+            FrameSrc::Bgra { buf, pitch } => copy_bgra_into_frame(&mut self.bgra_frame, buf, pitch),
+        }
         let t1 = std::time::Instant::now();
-        self.bgra_frame.set_pts(Some(pts_us));
-        self.scaler.run(&self.bgra_frame, &mut self.nv12_frame)?;
-        let t2 = std::time::Instant::now();
+        let t2 = match src {
+            FrameSrc::Nv12 { .. } => t1,
+            FrameSrc::Bgra { .. } => {
+                self.bgra_frame.set_pts(Some(pts_us));
+                self.scaler.run(&self.bgra_frame, &mut self.nv12_frame)?;
+                std::time::Instant::now()
+            }
+        };
         self.nv12_frame.set_pts(Some(pts_us));
         if self.force {
             // 注意：set_kind 要设在真正喂给编码器的 nv12 帧上（swscale 不保证传递 pict_type）
@@ -314,6 +384,7 @@ impl VideoEncoder for QsvEncoder {
 
 struct X264Encoder {
     encoder: Encoder,
+    nv12_frame: Video,
     bgra_frame: Video,
     yuv_frame: Video,
     scaler: Scaler,
@@ -349,6 +420,7 @@ impl X264Encoder {
         )?;
         Ok(Self {
             encoder,
+            nv12_frame: Video::new(Pixel::NV12, width, height),
             bgra_frame: Video::new(Pixel::BGRZ, width, height),
             yuv_frame: Video::new(Pixel::YUV420P, width, height),
             scaler,
@@ -369,17 +441,27 @@ impl VideoEncoder for X264Encoder {
         self.force = true;
     }
 
-    fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
-        copy_bgra_into_frame(&mut self.bgra_frame, bgra, pitch);
-        self.bgra_frame.set_pts(Some(pts_us));
-        self.scaler.run(&self.bgra_frame, &mut self.yuv_frame)?;
-        self.yuv_frame.set_pts(Some(pts_us));
+    fn encode(&mut self, src: FrameSrc, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
+        // x264 原生吃 nv12：主路径直拷；BGRA 回退走 swscale→YUV420P（旧路径原样）
+        let out_frame = match src {
+            FrameSrc::Nv12 { buf, pitch } => {
+                copy_nv12_into_frame(&mut self.nv12_frame, buf, pitch);
+                &mut self.nv12_frame
+            }
+            FrameSrc::Bgra { buf, pitch } => {
+                copy_bgra_into_frame(&mut self.bgra_frame, buf, pitch);
+                self.bgra_frame.set_pts(Some(pts_us));
+                self.scaler.run(&self.bgra_frame, &mut self.yuv_frame)?;
+                &mut self.yuv_frame
+            }
+        };
+        out_frame.set_pts(Some(pts_us));
         if self.force {
             // b=0(zerolatency)时强制 I 即 IDR,x264 默认每个 IDR 前重发 SPS/PPS
-            self.yuv_frame.set_kind(picture::Type::I);
+            out_frame.set_kind(picture::Type::I);
             self.force = false;
         }
-        self.encoder.send_frame(&self.yuv_frame)?;
+        self.encoder.send_frame(out_frame)?;
         drain(&mut self.encoder, &mut self.packet)
     }
 

@@ -114,7 +114,10 @@ impl GraphicsCaptureApiHandler for CaptureDemo {
             self.buf_bytes = buf.row_pitch() as usize * buf.height() as usize;
             let bgra = buf.as_nopadding_buffer(&mut scratch);
             let t0 = Instant::now();
-            let packets = w.0.encode(bgra, self.dims.0 as usize * 4, pts_us)?;
+            let packets = w.0.encode(
+                crate::encoder::FrameSrc::Bgra { buf: bgra, pitch: self.dims.0 as usize * 4 },
+                pts_us,
+            )?;
             self.encode_durations.push(t0.elapsed());
             for p in packets {
                 self.encoded_bytes += p.data.len() as u64;

@@ -2,6 +2,7 @@
 
 mod capture;
 mod encoder;
+mod gpu;
 mod input;
 mod serve;
 
