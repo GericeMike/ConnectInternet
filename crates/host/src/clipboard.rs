@@ -36,6 +36,7 @@ pub fn spawn() -> ClipboardHub {
         .spawn(move || {
             while let Ok((hash, text)) = write_rx.recv() {
                 LAST_SYNCED.store(hash, Ordering::SeqCst);
+                println!("[clip] 对端剪贴板写入 {} 字节", text.len());
                 if let Err(e) = write_clipboard_text(&text) {
                     eprintln!("[clip] 写入剪贴板失败: {e}");
                 }
@@ -123,6 +124,7 @@ unsafe extern "system" fn clip_wndproc(
                 let last = LAST_SYNCED.load(Ordering::SeqCst);
                 if hash != last && text.len() <= MAX_CLIP_TEXT {
                     LAST_SYNCED.store(hash, Ordering::SeqCst);
+                    println!("[clip] 本端剪贴板变化 hash={hash:016x} {} 字节", text.len());
                     // 取窗口 GWLP_USERDATA 里藏的 watch 发送端
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ChangesTx;
                     if let Some(tx) = ptr.as_ref() {

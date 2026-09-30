@@ -34,6 +34,7 @@ pub fn spawn() -> ClipboardBridge {
             };
             while let Ok((hash, text)) = write_rx.recv() {
                 LAST_SYNCED.store(hash, Ordering::SeqCst);
+                println!("[clip] 对端剪贴板写入 {} 字节", text.len());
                 if let Err(e) = board.set_text(text) {
                     eprintln!("[clip] 写入剪贴板失败: {e}");
                 }
@@ -59,6 +60,7 @@ pub fn spawn() -> ClipboardBridge {
                 let hash = rdlink_proto::fnv1a64(text.as_bytes());
                 if hash != LAST_SYNCED.load(Ordering::SeqCst) {
                     LAST_SYNCED.store(hash, Ordering::SeqCst);
+                    println!("[clip] 本端剪贴板变化 hash={hash:016x} {} 字节", text.len());
                     let _ = changes_tx.send((hash, text));
                 }
             }
