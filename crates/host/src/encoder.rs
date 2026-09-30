@@ -10,6 +10,7 @@ use ffmpeg::dictionary::Dictionary;
 use ffmpeg::format::Pixel;
 use ffmpeg::frame::Video;
 use ffmpeg::software::scaling::{Context as Scaler, Flags as ScaleFlags};
+use ffmpeg::picture;
 
 /// M1 默认参数档（T10 起可用环境变量覆盖做参数扫描）：
 ///   RDLINK_BITRATE_MBPS（默认 50）、RDLINK_GOP（默认 90，缩短关键帧间隔利于丢帧后快速恢复）
@@ -45,6 +46,9 @@ pub trait VideoEncoder {
     fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error>;
     /// 流结束,冲出编码器内残留的包
     fn flush(&mut self) -> Result<Vec<EncodedPacket>, ffmpeg::Error>;
+    /// 下一帧强制关键帧。编码器跨会话复用(M2-1c)时新会话首帧必须 IDR——
+    /// 新客户端没有参考链,吃 P 帧只能丢弃干等 GOP 自然关键帧(≤2.6s)。
+    fn force_key(&mut self);
 }
 
 /// 打开的编码器档位(兜底顺序 NVENC → QSV → x264)
@@ -123,6 +127,8 @@ struct NvencEncoder {
     encoder: Encoder,
     frame: Video,
     packet: Packet,
+    /// 下一帧强制 IDR（M2-1c 跨会话复用）
+    force: bool,
 }
 
 impl NvencEncoder {
@@ -144,9 +150,10 @@ impl NvencEncoder {
         opts.set("tune", "ull"); // ultra low latency:禁前视/B帧缓冲
         opts.set("rc", "cbr");
         opts.set("delay", "0"); // 输入一帧立即出一帧
+        opts.set("forced-idr", "1"); // force_key 的 I 帧必须是 IDR(带 SPS/PPS 重发)
         // open_as_with 返回 video::Encoder(已打开;Deref 链直达 send_frame/receive_packet)
         let encoder = ctx.open_as_with(codec, opts)?;
-        Ok(Self { encoder, frame: Video::new(Pixel::BGRZ, width, height), packet: Packet::empty() })
+        Ok(Self { encoder, frame: Video::new(Pixel::BGRZ, width, height), packet: Packet::empty(), force: false })
     }
 }
 
@@ -157,10 +164,17 @@ impl VideoEncoder for NvencEncoder {
     fn is_hardware(&self) -> bool {
         true
     }
+    fn force_key(&mut self) {
+        self.force = true;
+    }
 
     fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
         copy_bgra_into_frame(&mut self.frame, bgra, pitch);
         self.frame.set_pts(Some(pts_us));
+        if self.force {
+            self.frame.set_kind(picture::Type::I);
+            self.force = false;
+        }
         self.encoder.send_frame(&self.frame)?;
         drain(&mut self.encoder, &mut self.packet)
     }
@@ -179,6 +193,12 @@ struct QsvEncoder {
     nv12_frame: Video,
     scaler: Scaler,
     packet: Packet,
+    /// 下一帧强制 IDR（M2-1c 跨会话复用）
+    force: bool,
+    /// 分段耗时样本（µs）：拷贝 / swscale 转换 / 提交编码器+取包（M2-2 数据）
+    copy_us: Vec<u64>,
+    scale_us: Vec<u64>,
+    enc_us: Vec<u64>,
 }
 
 impl QsvEncoder {
@@ -198,6 +218,7 @@ impl QsvEncoder {
         opts.set("async_depth", "1"); // 默认 4,降为 1 换最低延迟
         opts.set("low_power", "1"); // VDENC 低功耗快路径(远程桌面场景设计,延迟最低)
         opts.set("scenario", "1"); // MFX_SCENARIO_DISPLAY_REMOTE(选项是整数枚举,字符串常量名会被当表达式报错)
+        opts.set("forced_idr", "1"); // force_key 的 I 帧必须是 IDR(带 SPS/PPS 重发)
         let encoder = ctx.open_as_with(codec, opts)?;
         let scaler = Scaler::get(
             Pixel::BGRZ,
@@ -214,8 +235,39 @@ impl QsvEncoder {
             nv12_frame: Video::new(Pixel::NV12, width, height),
             scaler,
             packet: Packet::empty(),
+            force: false,
+            copy_us: Vec::new(),
+            scale_us: Vec::new(),
+            enc_us: Vec::new(),
         })
     }
+
+    /// 分段样本满 150 帧（约 5s）报告一次 p50，给 M2-2 决定砍哪段
+    fn report_segments(&mut self) {
+        if self.enc_us.len() < 150 {
+            return;
+        }
+        let c = pct1(&mut self.copy_us);
+        let s = pct1(&mut self.scale_us);
+        let e = pct1(&mut self.enc_us);
+        println!(
+            "[qsv] 分段 p50: 拷贝 {:.1}ms | swscale {:.1}ms | 提交+取包 {:.1}ms",
+            c as f64 / 1000.0,
+            s as f64 / 1000.0,
+            e as f64 / 1000.0,
+        );
+        self.copy_us.clear();
+        self.scale_us.clear();
+        self.enc_us.clear();
+    }
+}
+
+fn pct1(samples: &mut [u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    samples[(samples.len() as f64 * 0.5) as usize]
 }
 
 impl VideoEncoder for QsvEncoder {
@@ -225,14 +277,31 @@ impl VideoEncoder for QsvEncoder {
     fn is_hardware(&self) -> bool {
         true
     }
+    fn force_key(&mut self) {
+        self.force = true;
+    }
 
     fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
+        let t0 = std::time::Instant::now();
         copy_bgra_into_frame(&mut self.bgra_frame, bgra, pitch);
+        let t1 = std::time::Instant::now();
         self.bgra_frame.set_pts(Some(pts_us));
         self.scaler.run(&self.bgra_frame, &mut self.nv12_frame)?;
+        let t2 = std::time::Instant::now();
         self.nv12_frame.set_pts(Some(pts_us));
+        if self.force {
+            // 注意：set_kind 要设在真正喂给编码器的 nv12 帧上（swscale 不保证传递 pict_type）
+            self.nv12_frame.set_kind(picture::Type::I);
+            self.force = false;
+        }
         self.encoder.send_frame(&self.nv12_frame)?;
-        drain(&mut self.encoder, &mut self.packet)
+        let out = drain(&mut self.encoder, &mut self.packet)?;
+        let t3 = std::time::Instant::now();
+        self.copy_us.push((t1 - t0).as_micros() as u64);
+        self.scale_us.push((t2 - t1).as_micros() as u64);
+        self.enc_us.push((t3 - t2).as_micros() as u64);
+        self.report_segments();
+        Ok(out)
     }
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
@@ -249,6 +318,8 @@ struct X264Encoder {
     yuv_frame: Video,
     scaler: Scaler,
     packet: Packet,
+    /// 下一帧强制 IDR（M2-1c 跨会话复用）
+    force: bool,
 }
 
 impl X264Encoder {
@@ -282,6 +353,7 @@ impl X264Encoder {
             yuv_frame: Video::new(Pixel::YUV420P, width, height),
             scaler,
             packet: Packet::empty(),
+            force: false,
         })
     }
 }
@@ -293,12 +365,20 @@ impl VideoEncoder for X264Encoder {
     fn is_hardware(&self) -> bool {
         false
     }
+    fn force_key(&mut self) {
+        self.force = true;
+    }
 
     fn encode(&mut self, bgra: &[u8], pitch: usize, pts_us: i64) -> Result<Vec<EncodedPacket>, ffmpeg::Error> {
         copy_bgra_into_frame(&mut self.bgra_frame, bgra, pitch);
         self.bgra_frame.set_pts(Some(pts_us));
         self.scaler.run(&self.bgra_frame, &mut self.yuv_frame)?;
         self.yuv_frame.set_pts(Some(pts_us));
+        if self.force {
+            // b=0(zerolatency)时强制 I 即 IDR,x264 默认每个 IDR 前重发 SPS/PPS
+            self.yuv_frame.set_kind(picture::Type::I);
+            self.force = false;
+        }
         self.encoder.send_frame(&self.yuv_frame)?;
         drain(&mut self.encoder, &mut self.packet)
     }

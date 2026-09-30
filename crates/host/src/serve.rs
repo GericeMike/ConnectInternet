@@ -43,6 +43,15 @@ fn epoch_us() -> i64 {
         .unwrap_or(0)
 }
 
+/// 进程级编码器缓存（M2-1c）：QSV 会话建立 ~200ms,跨会话按分辨率复用。
+/// 复用编码器的新会话首帧必须 force_key() 出 IDR（新客户端没有参考链）。
+struct EncCacheEntry {
+    w: u32,
+    h: u32,
+    enc: SendEncoder,
+}
+static ENC_CACHE: std::sync::Mutex<Option<EncCacheEntry>> = std::sync::Mutex::new(None);
+
 pub fn run() {
     let _ = HOST_EPOCH.set(Instant::now());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -120,11 +129,27 @@ async fn serve_session_inner(
     let t_session = Instant::now(); // M2-1a：会话启动全程分段计时的原点
     let (tx, mut rx) = mpsc::channel::<VideoFrame>(4);
 
+    // 编码器复用（M2-1c）：从进程缓存取，命中（分辨率一致）则省 ~200ms QSV 会话建立，
+    // 并强制新会话首帧出 IDR；未命中（首会话/分辨率变了）走捕获线程内现开。
+    let monitor_cur = windows_capture::monitor::Monitor::primary().expect("获取主显示器失败");
+    let (cw, ch) = (monitor_cur.width().expect("宽度"), monitor_cur.height().expect("高度"));
+    let mut cached_enc: Option<SendEncoder> = None;
+    {
+        let mut g = ENC_CACHE.lock().expect("编码器缓存锁");
+        if let Some(mut e) = g.take() {
+            if e.w == cw && e.h == ch {
+                e.enc.0.force_key(); // 复用首帧必须 IDR
+                println!("[session] 命中编码器缓存（省 QSV/编码器打开耗时）");
+                cached_enc = Some(e.enc);
+            }
+            // 分辨率变了 → 旧编码器直接丢弃，本次现开新的
+        }
+    }
     // free-threaded 启动：拿到 CaptureControl，会话结束后可从外部主动停止
     // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let capture_control = start_capture(tx.clone(), ready_tx, backlog.clone());
+    let capture_control = start_capture(tx.clone(), ready_tx, backlog.clone(), cached_enc);
 
     // 发送/输入任务必须先于首帧 nudge 启动：首帧入队后要立刻有人消费，
     // 否则会在 channel 里干等 nudge 兜底的 300ms（M2-1a 插桩实测白丢 ~290ms）。
@@ -208,6 +233,9 @@ async fn serve_session_inner(
 
     // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开 / 新主控端抢占。
     // 抢占时取消 read_frame 半读会损坏 control 帧边界——但该会话即将整体销毁，无碍。
+    // 失联看门狗（M2-1c）：client 被强杀时 QUIC 要等 idle timeout(10s) 才报错，期间死会话
+    // 僵占捕获、下一个主控端要先等它回收；client 正常每 500ms 一个 Ping，3s 无 Ping 即判失联。
+    let mut last_ping = tokio::time::Instant::now();
     loop {
         let msg = tokio::select! {
             m = read_frame(&mut control_recv) => m,
@@ -218,9 +246,14 @@ async fn serve_session_inner(
                 }
                 continue;
             }
+            _ = tokio::time::sleep_until(last_ping + std::time::Duration::from_secs(3)) => {
+                println!("主控端失联（3s 无 Ping），回收会话");
+                break;
+            }
         };
         match msg {
             Ok(Some(Message::Control(ControlMsg::Ping { t_us }))) => {
+                last_ping = tokio::time::Instant::now();
                 let host_recv_us = epoch_us();
                 let r = write_frame(
                     &mut control_send,
@@ -258,19 +291,29 @@ async fn serve_session_inner(
     drop(tx);
     drop(control_send);
     drop(control_recv);
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-        tokio::task::spawn_blocking(move || capture_control.stop()).await
-    })
-    .await;
-    // video 任务可能卡在对端死连接的流控写上（等 idle timeout 才报错）——不等待，
-    // 它会自行结束；统计改为尽力而为
-    if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_millis(300), video_task).await {
+    // 回收并行化（M2-1c）：被强杀的 client 会让 input 流读挂到超时——stop/video/input
+    // 三步串行最坏 900ms，并行后封顶 300ms（抢占路径上新主控端少等一半）；
+    // 编码器收回在 stop 完成后经 callback() try_lock 直取。
+    let handler = capture_control.callback();
+    let (_r_stop, r_video, r_input) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            tokio::task::spawn_blocking(move || capture_control.stop()).await
+        }),
+        tokio::time::timeout(std::time::Duration::from_millis(300), video_task),
+        tokio::time::timeout(std::time::Duration::from_millis(300), input_task),
+    );
+    if let Some(mut h) = handler.try_lock() {
+        if let Some(e) = h.enc.take() {
+            *ENC_CACHE.lock().expect("编码器缓存锁") = Some(EncCacheEntry { w: cw, h: ch, enc: e });
+            println!("[session] 编码器已归缓存");
+        }
+    }
+    // video/input 任务尽力收统计（对端死连接的阻塞读由超时兜底）
+    if let Ok(sent) = r_video {
         let (sent, bytes) = sent.unwrap_or((0, 0));
         println!("共发送 {sent} 帧视频（{:.1} MiB）", bytes as f64 / 1048576.0);
     }
-    if let Ok(Ok((injected, dropped))) =
-        tokio::time::timeout(std::time::Duration::from_millis(300), input_task).await
-    {
+    if let Ok(Ok((injected, dropped))) = r_input {
         if injected > 0 || dropped > 0 {
             println!("共注入 {injected} 个输入事件（{dropped} 个被系统拒绝）");
         }
@@ -289,8 +332,19 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
+/// 捕获线程启动参数（经 Settings Flags 注入）
+struct CaptureBoot {
+    tx: mpsc::Sender<VideoFrame>,
+    ready: std::sync::mpsc::Sender<()>,
+    backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// 启动时刻（M2-1a 分段计时）
+    launch: Instant,
+    /// 进程缓存命中的已打开编码器（None = 现开）
+    enc: Option<SendEncoder>,
+}
+
 struct ServeCapture {
-    enc: SendEncoder,
+    enc: Option<SendEncoder>,
     tx: mpsc::Sender<VideoFrame>,
     /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -311,38 +365,33 @@ struct ServeCapture {
 }
 
 impl GraphicsCaptureApiHandler for ServeCapture {
-    /// Flags：出口通道 + 就绪信号 + 队列深度计数 + 启动时刻（经 Settings 注入）
-    type Flags = (
-        mpsc::Sender<VideoFrame>,
-        std::sync::mpsc::Sender<()>,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        Instant,
-    );
+    type Flags = CaptureBoot;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (tx, ready, backlog, launch) = ctx.flags;
+        let CaptureBoot { tx, ready, backlog, launch, enc } = ctx.flags;
         // M2-1a 分段计时：start_free_threaded → new() = WGC 会话激活；
-        // open_auto 内部 = NVENC 探测 + QSV/x264 打开
+        // open_auto 内部 = NVENC 探测 + QSV/x264 打开（缓存命中时两者皆 0）
         let activation_ms = launch.elapsed().as_millis();
         let monitor = windows_capture::monitor::Monitor::primary()?;
         let (w, h) = (monitor.width()?, monitor.height()?);
-        let t_enc = Instant::now();
-        let (enc, tier) = encoder::open_auto(w, h)?;
-        let enc_open_ms = t_enc.elapsed().as_millis();
-        let enc_name = enc.name();
-        let tier_label = match tier {
-            encoder::EncoderTier::Nvenc => "NVENC 硬编",
-            encoder::EncoderTier::Qsv => "QSV 核显硬编",
-            encoder::EncoderTier::X264 => "x264 软编兜底",
+        let (enc, enc_open_ms, reused) = match enc {
+            Some(e) => (e, 0, true),
+            None => {
+                let t_enc = Instant::now();
+                let (e, _tier) = encoder::open_auto(w, h)?;
+                (SendEncoder(e), t_enc.elapsed().as_millis(), false)
+            }
         };
+        let enc_name = enc.0.name();
         println!(
-            "[capture] 启动分段: WGC 激活 {activation_ms}ms | 编码器打开 {enc_open_ms}ms（{enc_name}，{tier_label}）@ {w}x{h}"
+            "[capture] 启动分段: WGC 激活 {activation_ms}ms | 编码器打开 {enc_open_ms}ms{}（{enc_name}）@ {w}x{h}",
+            if reused { "（缓存复用）" } else { "" },
         );
         // 通知主任务：WGC 会话已建立，可以推首帧了
         let _ = ready.send(());
         Ok(Self {
-            enc: SendEncoder(enc),
+            enc: Some(enc),
             tx,
             backlog,
             start: Instant::now(),
@@ -366,10 +415,14 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         let w = frame.width() as usize;
 
         {
+            let Some(enc) = self.enc.as_mut() else {
+                ctrl.stop();
+                return Ok(());
+            };
             let fb = frame.buffer()?;
             let bgra = fb.as_nopadding_buffer(&mut self.scratch);
             let t0 = Instant::now();
-            let packets = self.enc.0.encode(bgra, w * 4, pts_us)?;
+            let packets = enc.0.encode(bgra, w * 4, pts_us)?;
             let e = t0.elapsed().as_micros() as u64;
             self.enc_us.push(e); // 窗口统计（p50/p95）
             let enc_us = e as u32; // 随帧下发（协议 v2，client 侧分段打点）
@@ -397,7 +450,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                         self.dropped += 1;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // 发送端已关闭（会话结束）→ 停止捕获
+                        // 发送端已关闭（会话结束）→ 停止捕获（编码器由会话侧经 callback() 收回）
                         ctrl.stop();
                         return Ok(());
                     }
@@ -456,9 +509,11 @@ fn start_capture(
     tx: mpsc::Sender<VideoFrame>,
     ready: std::sync::mpsc::Sender<()>,
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    enc: Option<SendEncoder>,
 ) -> windows_capture::capture::CaptureControl<ServeCapture, Box<dyn std::error::Error + Send + Sync>> {
     let monitor = windows_capture::monitor::Monitor::primary().expect("主显示器");
-    let launch = Instant::now(); // M2-1a：捕获线程启动计时原点（经 Flags 传给 new()）
+    let launch = Instant::now(); // M2-1a：捕获线程启动计时原点
+    let boot = CaptureBoot { tx, ready, backlog, launch, enc };
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::Default,
@@ -467,7 +522,7 @@ fn start_capture(
         MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        (tx, ready, backlog, launch),
+        boot,
     );
     ServeCapture::start_free_threaded(settings).expect("捕获启动失败")
 }
