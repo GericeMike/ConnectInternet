@@ -49,12 +49,17 @@ struct UiStats {
     enc_avg_us: AtomicU64,
     dec_avg_us: AtomicU64,
     rtt_us: AtomicU64,
+    /// 连接状态：0=正常 1=连接中 2=重连中（M2.5 自动重连）
+    conn_state: AtomicU64,
+    conn_attempt: AtomicU64,
 }
 
 /// 生产者-渲染共享帧槽（最新帧优先：生产者覆盖，渲染者取走）。
 type FrameSlot = Arc<Mutex<Option<FrameBuf>>>;
 /// host 画面分辨率（连接后由收流线程写入，输入坐标映射用）
 type HostSize = Arc<Mutex<(u32, u32)>>;
+/// 输入事件出口槽（按会话重建：断线重连后旧通道作废，收流线程换入新 Sender）
+type InputTxSlot = Arc<Mutex<Option<mpsc::UnboundedSender<InputEvent>>>>;
 
 struct FrameBuf {
     bgra: Vec<u8>,
@@ -98,8 +103,8 @@ struct StreamApp {
     display_vsync: bool,
     slot: FrameSlot,
     host_size: HostSize,
-    /// 输入事件出口（winit 主线程 → 收流线程的发送任务）
-    input_tx: Option<mpsc::UnboundedSender<InputEvent>>,
+    /// 输入事件出口槽（winit 主线程 → 当前会话的发送任务；重连时由收流线程换新）
+    input_tx_slot: InputTxSlot,
     /// 退出信号（主线程 → 收流线程：先把 Bye 真正发完再退出）
     shutdown_tx: Option<mpsc::Sender<()>>,
     fullscreen: bool,
@@ -124,7 +129,7 @@ impl StreamApp {
             display_vsync: vsync,
             slot: Arc::new(Mutex::new(None)),
             host_size: Arc::new(Mutex::new((0, 0))),
-            input_tx: None,
+            input_tx_slot: Arc::new(Mutex::new(None)),
             shutdown_tx: None,
             fullscreen: false,
             rendered: 0,
@@ -137,7 +142,7 @@ impl StreamApp {
     }
 
     fn forward_input(&self, ev: InputEvent) {
-        if let Some(tx) = &self.input_tx {
+        if let Some(tx) = self.input_tx_slot.lock().unwrap().as_ref() {
             let _ = tx.send(ev); // 通道关闭（会话已断）时静默丢弃
         }
     }
@@ -145,7 +150,6 @@ impl StreamApp {
     fn spawn_stream_thread(
         &self,
         window: Arc<Window>,
-        input_rx: mpsc::UnboundedReceiver<InputEvent>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
         let addr = self.addr.clone();
@@ -153,6 +157,7 @@ impl StreamApp {
         let slot = self.slot.clone();
         let host_size = self.host_size.clone();
         let ui = self.ui.clone();
+        let input_tx_slot = self.input_tx_slot.clone();
         std::thread::Builder::new()
             .name("rdlink-stream".into())
             .spawn(move || {
@@ -160,7 +165,9 @@ impl StreamApp {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(stream_loop(addr, pin, slot, host_size, ui, window, input_rx, shutdown_rx));
+                rt.block_on(stream_loop(
+                    addr, pin, slot, host_size, ui, input_tx_slot, window, shutdown_rx,
+                ));
             })
             .expect("收流线程创建失败");
     }
@@ -175,38 +182,85 @@ impl StreamApp {
     }
 }
 
-/// 收流+解码循环（工作线程）。同时跑两个任务：视频收流解码、输入事件发送。
+/// 会话结束原因
+enum SessionExit {
+    /// 用户主动退出（Esc/关窗）
+    User,
+    /// 连接丢失（M2.5：监督循环自动重连）
+    Lost,
+}
+
+/// 收流+解码（工作线程）。M2.5 起为监督循环：连接丢失后指数退避自动重连，
+/// 窗口/渲染全程复用（画面保留最后一帧，标题栏显示重连进度）。
 async fn stream_loop(
     addr: String,
     pin: String,
     slot: FrameSlot,
     host_size: HostSize,
     ui: Arc<UiStats>,
+    input_tx_slot: InputTxSlot,
     window: Arc<Window>,
-    mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
-    let t0 = Instant::now();
-    let session = match connect(
-        addr.parse().expect("地址格式: ip:port"),
-        &pin,
-        "rdlink-client",
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("连接失败: {e}");
-            return;
+    let mut attempt: u64 = 0;
+    loop {
+        // 重连退避：1s→2s→4s→8s→10s 封顶（首次连接不等待）
+        if attempt > 0 {
+            let backoff = Duration::from_millis(std::cmp::min(500u64 << attempt.min(5), 10_000));
+            ui.conn_state.store(2, Ordering::Relaxed);
+            ui.conn_attempt.store(attempt, Ordering::Relaxed);
+            println!("第 {attempt} 次重连（{backoff:?} 后重试）…");
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown_rx.recv() => return, // 等待重连期间用户退出
+            }
         }
-    };
-    println!(
-        "已连接 host: {}（握手 {:?}）",
-        session.peer_name,
-        t0.elapsed()
-    );
+        ui.conn_state.store(1, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let session = match connect(addr.parse().expect("地址格式: ip:port"), &pin, "rdlink-client").await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("连接失败: {e}");
+                attempt += 1;
+                continue;
+            }
+        };
+        println!("已连接 host: {}（握手 {:?}）", session.peer_name, t0.elapsed());
+        attempt = 0;
+        ui.conn_state.store(0, Ordering::Relaxed);
 
-    // 解构会话：input 流给发送任务，control 拆收/发两任务，video 留在本循环
+        // 输入通道按会话重建：换入新 Sender，旧通道随旧会话销毁
+        // （断线期间积在旧通道里的事件直接作废，不重放）
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        *input_tx_slot.lock().unwrap() = Some(input_tx);
+
+        match session_run(
+            session, input_rx, slot.clone(), host_size.clone(), ui.clone(), window.clone(), &mut shutdown_rx,
+        )
+        .await
+        {
+            SessionExit::User => {
+                *input_tx_slot.lock().unwrap() = None;
+                return;
+            }
+            SessionExit::Lost => {
+                *input_tx_slot.lock().unwrap() = None;
+                attempt += 1; // 退避从 1s 起
+            }
+        }
+    }
+}
+
+/// 单个会话：对时 + 视频收流解码 + 输入转发，直到断线或用户退出。
+async fn session_run(
+    session: rdlink_transport::ClientSession,
+    mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    slot: FrameSlot,
+    host_size: HostSize,
+    ui: Arc<UiStats>,
+    window: Arc<Window>,
+    shutdown: &mut mpsc::Receiver<()>,
+) -> SessionExit {
     let rdlink_transport::ClientSession {
         peer_name: _,
         video_info,
@@ -222,7 +276,7 @@ async fn stream_loop(
         *host_size.lock().unwrap() = (*width, *height);
     }
 
-    // 输入发送任务：winit 主线程 → input_rx → Input 流（随进程退出结束）
+    // 输入发送任务：winit 主线程 → input_rx → Input 流（写失败=断线，任务退出）
     tokio::spawn(async move {
         while let Some(ev) = input_rx.recv().await {
             if write_frame(&mut input, &Message::Input(ev)).await.is_err() {
@@ -252,7 +306,7 @@ async fn stream_loop(
     let (bye_tx, mut bye_rx) = mpsc::channel::<String>(1);
     {
         let mut control_send = control_send;
-        // 发方向：定时 Ping；视频循环结束后经 bye 通道发 Bye
+        // 发方向：定时 Ping；会话结束后经 bye 通道发 Bye
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -285,7 +339,7 @@ async fn stream_loop(
         Ok(d) => d,
         Err(e) => {
             eprintln!("解码器初始化失败: {e}");
-            return;
+            return SessionExit::Lost;
         }
     };
     let mut got_idr = false;
@@ -297,6 +351,7 @@ async fn stream_loop(
     let mut dec_sum = 0u64;
     let mut sec_frames = 0u64;
     let mut sec_started = Instant::now();
+    let mut exit = SessionExit::Lost;
 
     loop {
         // select 场景取消 read_frame 半读会丢帧——仅在退出时发生，可接受
@@ -312,8 +367,11 @@ async fn stream_loop(
                     break;
                 }
             },
-            _ = shutdown_rx.recv() => {
-                println!("收到退出信号，收尾中…");
+            _ = shutdown.recv() => {
+                // 干净退出：经 control 任务发 Bye（host 立刻感知回收）
+                let _ = bye_tx.send("client 退出".into()).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                exit = SessionExit::User;
                 break;
             }
         };
@@ -326,7 +384,7 @@ async fn stream_loop(
                 continue;
             }
             got_idr = true;
-            println!("首 IDR 到达（丢弃 {skipped_before_idr} 个非关键包，连接→此刻 {:?}）", t0.elapsed());
+            println!("首 IDR 到达（丢弃 {skipped_before_idr} 个非关键包）");
         }
 
         // 端到端（host 采集 → client 收包），对时有效后才有意义。
@@ -394,10 +452,15 @@ async fn stream_loop(
         }
     }
 
-    // 干净退出：经 control 任务发 Bye（host 立刻感知回收，不干等 idle timeout）
-    let _ = bye_tx.send("client 退出".into()).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    println!("video 流结束（共解码 {} 帧）", decoder.frames);
+    println!(
+        "会话结束（{}）（共解码 {} 帧）",
+        match exit {
+            SessionExit::User => "用户退出",
+            SessionExit::Lost => "连接丢失",
+        },
+        decoder.frames
+    );
+    exit
 }
 
 impl ApplicationHandler for StreamApp {
@@ -416,11 +479,9 @@ impl ApplicationHandler for StreamApp {
         println!("渲染就绪，连接 {} …（窗口模式 | F11 切全屏 | Esc 退出）", self.addr);
 
         self.connect_started = Some(Instant::now());
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
-        self.input_tx = Some(input_tx);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
-        self.spawn_stream_thread(window.clone(), input_rx, shutdown_rx);
+        self.spawn_stream_thread(window.clone(), shutdown_rx);
         display.render();
         self.display = Some(display);
         self.window = Some(window);
@@ -540,16 +601,27 @@ impl ApplicationHandler for StreamApp {
 
                 if self.last_title.elapsed().as_secs_f32() >= 1.0 {
                     let u = &self.ui;
-                    let r = |v: &AtomicU64| v.load(Ordering::Relaxed) / 1000;
-                    window.set_title(&format!(
-                        "rdlink | {}fps | e2e {}ms(p95 {}) | enc {} dec {} | rtt {}",
-                        u.fps.load(Ordering::Relaxed),
-                        r(&u.e2e_p50_us),
-                        r(&u.e2e_p95_us),
-                        r(&u.enc_avg_us),
-                        r(&u.dec_avg_us),
-                        r(&u.rtt_us),
-                    ));
+                    let state = u.conn_state.load(Ordering::Relaxed);
+                    if state > 0 {
+                        // 断线/连接中：标题栏给重连反馈（画面保留最后一帧）
+                        let label = if state == 2 { "重连中" } else { "连接中" };
+                        window.set_title(&format!(
+                            "rdlink | {label}（第 {} 次）… | rtt {}ms",
+                            u.conn_attempt.load(Ordering::Relaxed),
+                            u.rtt_us.load(Ordering::Relaxed) / 1000,
+                        ));
+                    } else {
+                        let r = |v: &AtomicU64| v.load(Ordering::Relaxed) / 1000;
+                        window.set_title(&format!(
+                            "rdlink | {}fps | e2e {}ms(p95 {}) | enc {} dec {} | rtt {}",
+                            u.fps.load(Ordering::Relaxed),
+                            r(&u.e2e_p50_us),
+                            r(&u.e2e_p95_us),
+                            r(&u.enc_avg_us),
+                            r(&u.dec_avg_us),
+                            r(&u.rtt_us),
+                        ));
+                    }
                     self.title_frames = 0;
                     self.last_title = Instant::now();
                 }

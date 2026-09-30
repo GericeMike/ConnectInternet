@@ -176,6 +176,9 @@ async fn serve_session_inner(
 
     // 发送/输入任务必须先于首帧 nudge 启动：首帧入队后要立刻有人消费，
     // 否则会在 channel 里干等 nudge 兜底的 300ms（M2-1a 插桩实测白丢 ~290ms）。
+    // video_dead：捕获链路失活信号（M2.5 看门狗）——捕获线程/GPU 死掉时 control
+    // 心跳照常，只有 video 断粮；不回收的话主控端永远挂着冻结画面。
+    let (video_dead_tx, mut video_dead_rx) = tokio::sync::watch::channel(false);
     let backlog2 = backlog.clone();
     let video_task = tokio::spawn(async move {
         let mut video = video;
@@ -184,7 +187,27 @@ async fn serve_session_inner(
         let mut lat_sum = 0u64;
         let mut lat_max = 0u64;
         let mut last_report = Instant::now();
-        while let Some(frame) = rx.recv().await {
+        // M2.5 活性看门狗：静止桌面 WGC 不产帧属正常，4s 无帧先 nudge 探活
+        // （必能逼出一帧）；连续 3 次探不出（~12s）判捕获/GPU 死亡 → 回收会话
+        let mut silent_probes = 0u32;
+        loop {
+            let frame = match tokio::time::timeout(std::time::Duration::from_secs(4), rx.recv()).await {
+                Ok(Some(frame)) => {
+                    silent_probes = 0;
+                    frame
+                }
+                Ok(None) => break, // 通道关闭（会话回收路径）
+                Err(_) => {
+                    silent_probes += 1;
+                    nudge_cursor();
+                    if silent_probes >= 3 {
+                        eprintln!("⚠️ 视频链路失活（12s 无帧且 nudge 探不出，疑似捕获/GPU 异常）→ 回收会话");
+                        let _ = video_dead_tx.send(true);
+                        break;
+                    }
+                    continue;
+                }
+            };
             let len = frame.data.len() as u64;
             match write_frame(&mut video, &Message::VideoFrame(frame.clone())).await {
                 Ok(()) => {
@@ -265,6 +288,15 @@ async fn serve_session_inner(
             _ = preempt.changed() => {
                 if *preempt.borrow() {
                     println!("新主控端接入，当前会话让位");
+                    break;
+                }
+                continue;
+            }
+            _ = video_dead_rx.changed() => {
+                // 捕获链路死亡（M2.5 看门狗）：心跳还在但画面断了，必须回收，
+                // 否则主控端永远挂着冻结帧
+                if *video_dead_rx.borrow() {
+                    println!("视频链路失活，回收会话");
                     break;
                 }
                 continue;
