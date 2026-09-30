@@ -52,6 +52,7 @@ async fn handshake_and_exchange_all_three_channels() {
             &Message::VideoFrame(VideoFrame {
                 capture_pts_us: 12345,
                 key: true,
+                encode_us: 5000,
                 data: vec![0x55; 2048],
             }),
         )
