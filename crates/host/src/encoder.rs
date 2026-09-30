@@ -55,23 +55,30 @@ pub enum EncoderTier {
     X264,
 }
 
+/// NVENC 探测结论进程级缓存：失败一次后本进程不再重试。
+/// 否则每个新会话都白付一次驱动探测（R580 掐 Pascal 的环境下结论恒为失败）。
+static NVENC_DEAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// 打开编码器:NVENC 失败落 Intel QSV 核显硬编,再失败落 x264 软编(均日志高亮)。
 pub fn open_auto(width: u32, height: u32) -> Result<(Box<dyn VideoEncoder>, EncoderTier), ffmpeg::Error> {
-    match NvencEncoder::open(width, height) {
-        Ok(e) => Ok((Box::new(e), EncoderTier::Nvenc)),
-        Err(err) => {
-            eprintln!("⚠️ h264_nvenc 打开失败({err})→ 尝试 Intel QSV 核显硬编");
-            match QsvEncoder::open(width, height) {
-                Ok(e) => {
-                    eprintln!("✅ 已切换 h264_qsv(核显硬编,无驱动回滚需求)");
-                    Ok((Box::new(e), EncoderTier::Qsv))
-                }
-                Err(err2) => {
-                    eprintln!("⚠️⚠️ h264_qsv 也失败({err2})→ 最后兜底 libx264 ultrafast+zerolatency 软编,性能将显著下降 ⚠️⚠️");
-                    let e = X264Encoder::open(width, height)?;
-                    Ok((Box::new(e), EncoderTier::X264))
-                }
+    if NVENC_DEAD.get().is_none() {
+        match NvencEncoder::open(width, height) {
+            Ok(e) => return Ok((Box::new(e), EncoderTier::Nvenc)),
+            Err(err) => {
+                let _ = NVENC_DEAD.set(());
+                eprintln!("⚠️ h264_nvenc 打开失败({err})→ 尝试 Intel QSV 核显硬编（本进程后续会话不再重试 NVENC）");
             }
+        }
+    }
+    match QsvEncoder::open(width, height) {
+        Ok(e) => {
+            eprintln!("✅ 已切换 h264_qsv(核显硬编,无驱动回滚需求)");
+            Ok((Box::new(e), EncoderTier::Qsv))
+        }
+        Err(err2) => {
+            eprintln!("⚠️⚠️ h264_qsv 也失败({err2})→ 最后兜底 libx264 ultrafast+zerolatency 软编,性能将显著下降 ⚠️⚠️");
+            let e = X264Encoder::open(width, height)?;
+            Ok((Box::new(e), EncoderTier::X264))
         }
     }
 }
