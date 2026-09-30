@@ -19,8 +19,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_SAMPLE_DESC,
 };
 
 /// 回读结果：连续缓冲，Y 平面（h 行 × w 字节）后接 UV 交错平面（h/2 行 × w 字节），
@@ -113,10 +112,6 @@ fn viewport(w: u32, h: u32) -> D3D11_VIEWPORT {
     }
 }
 
-fn box_wh(w: u32, h: u32) -> D3D11_BOX {
-    D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 }
-}
-
 pub struct GpuConverter {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
@@ -133,8 +128,12 @@ pub struct GpuConverter {
     y_rtv: ID3D11RenderTargetView,
     uv_tex: ID3D11Texture2D,
     uv_rtv: ID3D11RenderTargetView,
-    nv12_tex: ID3D11Texture2D,
-    staging: ID3D11Texture2D,
+    /// 双平面 staging 回读（M2.5a 修订）：不再经 NV12 纹理平面拷贝——
+    /// CopySubresourceRegion R8→NV12 平面在部分 Intel 驱动上会静默失败
+    /// （被控端 UHD 620 全绿屏实锤；4060 正常）。R8G8 的行布局恰好等于
+    /// NV12 的 UV 交错行，逐行 memcpy 拼 NV12 即可。
+    staging_y: ID3D11Texture2D,
+    staging_uv: ID3D11Texture2D,
     w: u32,
     h: u32,
     /// 回读暂存（pitch 对齐后 Y+UV 全量），复用避免每帧分配
@@ -142,6 +141,8 @@ pub struct GpuConverter {
     pitch: usize,
     /// WGC 帧纹理可直接建 SRV（省掉每帧 8MB 中间拷贝；不支持则走 CopyResource 中转）
     frame_srv_ok: bool,
+    /// 探活计数（每 90 帧输出一次非零占比，诊断用）
+    probe_n: u32,
 }
 
 impl GpuConverter {
@@ -217,13 +218,26 @@ impl GpuConverter {
         unsafe { device.CreateRenderTargetView(&uv_tex, None, Some(&mut out as *mut _))? };
         let uv_rtv = out.unwrap();
 
-        // NV12 纹理无需任何 bind（只做平面拷贝的目标）；staging 回读
-        let nv12_tex = make_tex(DXGI_FORMAT_NV12, w, h, 0)?;
-        let staging = {
+        // 双平面 staging：Y(R8 全分辨率) + UV(R8G8 半分辨率)，CPU 拼 NV12
+        let make_staging = |fmt, tw, th| -> windows::core::Result<ID3D11Texture2D> {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: tw,
+                Height: th,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: fmt,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
             let mut t: Option<ID3D11Texture2D> = None;
-            unsafe { device.CreateTexture2D(&desc2(w, h), None, Some(&mut t as *mut _))? };
-            t.ok_or(windows::core::Error::from_hresult(windows::core::HRESULT(-1)))?
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut t as *mut _))? };
+            t.ok_or(windows::core::Error::from_hresult(windows::core::HRESULT(-1)))
         };
+        let staging_y = make_staging(DXGI_FORMAT_R8_UNORM, w, h)?;
+        let staging_uv = make_staging(DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2)?;
 
         Ok(Self {
             device: device.clone(),
@@ -239,13 +253,14 @@ impl GpuConverter {
             y_rtv,
             uv_tex,
             uv_rtv,
-            nv12_tex,
-            staging,
+            staging_y,
+            staging_uv,
             w,
             h,
             scratch: Vec::new(),
             pitch: 0,
             frame_srv_ok: true,
+            probe_n: 0,
         })
     }
 
@@ -256,20 +271,22 @@ impl GpuConverter {
             // 图元拓扑：默认 UNDEFINED 下 Draw 无效；关剔除：默认 CullBack 会剔掉 CCW 全屏三角形
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.RSSetState(&self.rs);
-            // 1) 源 SRV：优先直接用 WGC 帧纹理（弱核显上每帧 8MB 中转拷贝是流量大头，
-            //    能省则省）；帧纹理不带 SHADER_RESOURCE 绑定时回退自有 BGRA 中转
+            // 1) 源 SRV：优先直接用 WGC 帧纹理（省每帧 8MB 中转拷贝）；
+            //    帧纹理不带 SHADER_RESOURCE 绑定时回退自有 BGRA 中转（并记日志）
             let srv: ID3D11ShaderResourceView = if self.frame_srv_ok {
                 let mut s: Option<ID3D11ShaderResourceView> = None;
                 match self.device.CreateShaderResourceView(frame_tex, None, Some(&mut s as *mut _)) {
                     Ok(()) => match s {
                         Some(srv) => srv,
                         None => {
+                            eprintln!("[gpu] WGC 帧纹理不可建 SRV → 改走 BGRA 中转拷贝");
                             self.frame_srv_ok = false;
                             ctx.CopyResource(&self.bgra_tex, frame_tex);
                             self.bgra_srv.clone()
                         }
                     },
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!("[gpu] WGC 帧纹理建 SRV 失败({e}) → 改走 BGRA 中转拷贝");
                         self.frame_srv_ok = false;
                         ctx.CopyResource(&self.bgra_tex, frame_tex);
                         self.bgra_srv.clone()
@@ -294,42 +311,54 @@ impl GpuConverter {
             ctx.OMSetRenderTargets(Some(&[Some(self.uv_rtv.clone())]), None);
             ctx.RSSetViewports(Some(&[viewport(self.w / 2, self.h / 2)]));
             ctx.Draw(3, 0);
-
-            // 4) 解绑 RT 后平面拷入 NV12（R8→Y 平面、R8G8→UV 平面）
             ctx.OMSetRenderTargets(None, None);
-            ctx.CopySubresourceRegion(&self.nv12_tex, 0, 0, 0, 0, &self.y_tex, 0, Some(&box_wh(self.w, self.h)));
-            ctx.CopySubresourceRegion(&self.nv12_tex, 1, 0, 0, 0, &self.uv_tex, 0, Some(&box_wh(self.w / 2, self.h / 2)));
 
-            // 5) 回读
-            ctx.CopyResource(&self.staging, &self.nv12_tex);
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            let pitch = mapped.RowPitch as usize;
-            let h = self.h as usize;
-            let total = pitch * h * 3 / 2;
-            let src = std::slice::from_raw_parts(mapped.pData as *const u8, total);
+            // 4) 双平面回读 + CPU 拼 NV12（不碰 NV12 纹理/平面拷贝——Intel 驱动坑）
+            //    全纹理 CopyResource（DEFAULT→STAGING 同格式）是最基础的操作，驱动兼容性无忧
+            ctx.OMSetRenderTargets(None, None);
+            ctx.CopyResource(&self.staging_y, &self.y_tex);
+            ctx.CopyResource(&self.staging_uv, &self.uv_tex);
+            let mut my = D3D11_MAPPED_SUBRESOURCE::default();
+            let mut muv = D3D11_MAPPED_SUBRESOURCE::default();
+            ctx.Map(&self.staging_y, 0, D3D11_MAP_READ, 0, Some(&mut my))?;
+            ctx.Map(&self.staging_uv, 0, D3D11_MAP_READ, 0, Some(&mut muv))?;
+            let (pitch, h, w) = (my.RowPitch as usize, self.h as usize, self.w as usize);
+            let y_src = std::slice::from_raw_parts(my.pData as *const u8, pitch * h);
+            let uv_pitch = muv.RowPitch as usize;
+            let uv_src = std::slice::from_raw_parts(muv.pData as *const u8, uv_pitch * (h / 2));
+
+            // 探针（每 90 帧）：Y/UV 非零占比——全零即 GPU 链路产出废数据
+            self.probe_n += 1;
+            if self.probe_n % 90 == 1 {
+                let nz = |s: &[u8]| s.iter().filter(|&&b| b != 0).count() * 100 / s.len().max(1);
+                let (y_len, uv_len) = (pitch * h, uv_pitch * (h / 2));
+                println!(
+                    "[gpu] 探针#{}: Y 非零 {}% / UV 非零 {}%（{} 路径）",
+                    self.probe_n,
+                    nz(&y_src[..y_len]),
+                    nz(&uv_src[..uv_len]),
+                    if self.frame_srv_ok { "直连SRV" } else { "BGRA中转" },
+                );
+            }
+
             self.scratch.clear();
-            self.scratch.extend_from_slice(src);
+            self.scratch.resize(pitch * h * 3 / 2, 0);
+            let dst = self.scratch.as_mut_slice();
+            for r in 0..h {
+                dst[r * pitch..r * pitch + w]
+                    .copy_from_slice(&y_src[r * pitch..r * pitch + w]);
+            }
+            let uv_off = pitch * h;
+            for r in 0..h / 2 {
+                // R8G8 行 = Cb,Cr 交错 = NV12 UV 行，原样搬运
+                dst[uv_off + r * pitch..uv_off + r * pitch + w]
+                    .copy_from_slice(&uv_src[r * uv_pitch..r * uv_pitch + w]);
+            }
             self.pitch = pitch;
-            ctx.Unmap(&self.staging, 0);
+            ctx.Unmap(&self.staging_y, 0);
+            ctx.Unmap(&self.staging_uv, 0);
         }
         let buf = self.scratch.as_slice();
         Ok(Nv12View { buf, pitch: self.pitch })
-    }
-}
-
-/// NV12 staging 描述
-fn desc2(w: u32, h: u32) -> D3D11_TEXTURE2D_DESC {
-    D3D11_TEXTURE2D_DESC {
-        Width: w,
-        Height: h,
-        MipLevels: 1,
-        ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-        MiscFlags: 0,
     }
 }
