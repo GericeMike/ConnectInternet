@@ -64,6 +64,12 @@ async fn async_main() {
     println!("监听: {}", listener.local_addr().expect("local_addr"));
     println!("证书指纹（填给 client）: {}", listener.fingerprint);
 
+    // 会话串行闸：accept 循环与会话生命周期解耦（前一会话回收期间新连接的握手
+    // 不再被阻塞超时），但同时只允许一个会话占用捕获（后来者握完手等待）
+    let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    // 抢占信号：新主控端接入时通知当前会话提前回收（不等 idle timeout 的 10s）
+    let (preempt_tx, preempt_rx) = tokio::sync::watch::channel(false);
+
     loop {
         // 每个会话重新取主显示器（分辨率可能在会话间变化）
         let monitor = windows_capture::monitor::Monitor::primary().expect("获取主显示器失败");
@@ -78,13 +84,25 @@ async fn async_main() {
             }
         };
         println!("主控端已连接: {}（{w}x{h}）", session.peer_name);
-        serve_session(session).await;
-        println!("会话结束，等待下一个主控端…");
+        // 通知旧会话让位
+        let _ = preempt_tx.send(true);
+        let gate = gate.clone();
+        let preempt_tx = preempt_tx.clone();
+        let preempt = preempt_rx.clone();
+        tokio::spawn(async move {
+            let _permit = gate.lock().await; // 前一会话占用捕获时，本会话在此等待
+            let _ = preempt_tx.send(false); // 自己上岗后复位信号（供再下一个会话抢占）
+            serve_session_inner(session, preempt).await;
+            println!("会话结束，等待下一个主控端…");
+        });
     }
 }
 
-/// 服务一个会话直到断开。
-async fn serve_session(session: HostSession) {
+/// 服务一个会话直到断开或被新主控端抢占。
+async fn serve_session_inner(
+    session: HostSession,
+    mut preempt: tokio::sync::watch::Receiver<bool>,
+) {
     let HostSession {
         peer_name,
         mut control_send,
@@ -182,9 +200,20 @@ async fn serve_session(session: HostSession) {
         (injected, dropped)
     });
 
-    // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开检测
+    // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开 / 新主控端抢占。
+    // 抢占时取消 read_frame 半读会损坏 control 帧边界——但该会话即将整体销毁，无碍。
     loop {
-        match read_frame(&mut control_recv).await {
+        let msg = tokio::select! {
+            m = read_frame(&mut control_recv) => m,
+            _ = preempt.changed() => {
+                if *preempt.borrow() {
+                    println!("新主控端接入，当前会话让位");
+                    break;
+                }
+                continue;
+            }
+        };
+        match msg {
             Ok(Some(Message::Control(ControlMsg::Ping { t_us }))) => {
                 let host_recv_us = epoch_us();
                 let r = write_frame(
@@ -217,17 +246,24 @@ async fn serve_session(session: HostSession) {
     }
 
     // 回收：drop 剩余 tx → 主动停捕获（WM_QUIT；静止桌面时线程不会自己发现通道关闭）
-    //      → channel 排空 → 发送/注入任务结束
+    //      → channel 排空 → 发送/注入任务结束。
+    // 超时只是防悬挂兜底（正常路径秒退）；对端异常消失时流要等 idle timeout(10s) 才报错，
+    // 这里不等它——新会话抢占优先（超时后任务自然结束，permit 已释放）
     drop(tx);
     drop(control_send);
     drop(control_recv);
-    let _ = tokio::task::spawn_blocking(move || capture_control.stop()).await;
-    if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_secs(10), video_task).await {
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        tokio::task::spawn_blocking(move || capture_control.stop()).await
+    })
+    .await;
+    // video 任务可能卡在对端死连接的流控写上（等 idle timeout 才报错）——不等待，
+    // 它会自行结束；统计改为尽力而为
+    if let Ok(sent) = tokio::time::timeout(std::time::Duration::from_millis(300), video_task).await {
         let (sent, bytes) = sent.unwrap_or((0, 0));
         println!("共发送 {sent} 帧视频（{:.1} MiB）", bytes as f64 / 1048576.0);
     }
     if let Ok(Ok((injected, dropped))) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), input_task).await
+        tokio::time::timeout(std::time::Duration::from_millis(300), input_task).await
     {
         if injected > 0 || dropped > 0 {
             println!("共注入 {injected} 个输入事件（{dropped} 个被系统拒绝）");
