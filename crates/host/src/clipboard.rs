@@ -37,8 +37,25 @@ pub fn spawn() -> ClipboardHub {
             while let Ok((hash, text)) = write_rx.recv() {
                 LAST_SYNCED.store(hash, Ordering::SeqCst);
                 println!("[clip] 对端剪贴板写入 {} 字节", text.len());
-                if let Err(e) = write_clipboard_text(&text) {
-                    eprintln!("[clip] 写入剪贴板失败: {e}");
+                // 剪贴板被其他程序（远控/输入法/微信类常驻）频繁占是常态，
+                // 8×300ms 持久重试抢窗口期；全部失败则放弃（日志留痕）
+                let mut ok = false;
+                for attempt in 1..=8 {
+                    match write_clipboard_text(&text) {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt == 1 || attempt == 8 {
+                                eprintln!("[clip] 写入第 {attempt} 次失败: {e}");
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                    }
+                }
+                if !ok {
+                    eprintln!("[clip] 放弃本次写入（环境争抢过烈）");
                 }
             }
         })
@@ -79,7 +96,9 @@ fn listen_loop(tx: ChangesTx) -> Result<(), String> {
         if atom == 0 {
             return Err("RegisterClassW 失败".into());
         }
-        // message-only 窗口：不显示、不可聚焦，只收广播消息（含 WM_CLIPBOARDUPDATE）
+        // 不可见顶层窗口（不能用 message-only：HWND_MESSAGE 窗口在 Win10 19045
+        // 上收不到 WM_CLIPBOARDUPDATE 广播，被控端实测监听全程哑火）。
+        // 不调用 ShowWindow，纯隐身。
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
@@ -89,7 +108,7 @@ fn listen_loop(tx: ChangesTx) -> Result<(), String> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             None,
             None,
@@ -140,7 +159,8 @@ unsafe extern "system" fn clip_wndproc(
 
 // ---------- 剪贴板读写原语 ----------
 
-fn read_clipboard_text() -> Option<String> {
+/// 读取本机剪贴板文本（`--get-clip` 调试子命令复用）
+pub fn read_clipboard_text() -> Option<String> {
     unsafe {
         use windows::Win32::Foundation::HGLOBAL;
         use windows::Win32::System::DataExchange::*;
@@ -169,23 +189,37 @@ fn read_clipboard_text() -> Option<String> {
     }
 }
 
-fn write_clipboard_text(text: &str) -> windows::core::Result<()> {
+/// 写本机剪贴板文本（`--set-clip` 调试子命令复用）
+pub fn write_clipboard_text(text: &str) -> windows::core::Result<()> {
     unsafe {
         use windows::Win32::Foundation::{GlobalFree, HANDLE};
         use windows::Win32::System::DataExchange::*;
         use windows::Win32::System::Memory::*;
         use windows::Win32::System::Ole::CF_UNICODETEXT;
-        OpenClipboard(None)?;
-        let r = (|| -> windows::core::Result<()> {
-            EmptyClipboard()?;
+        // 剪贴板是易争抢的共享资源（剪贴板管理器/输入法都常驻打开它），
+        // OpenClipboard 失败重试是标准做法（Raymond Chen 背书）
+        let mut opened = false;
+        for _ in 0..20 {
+            if OpenClipboard(None).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !opened {
+            let msg = format!("OpenClipboard 重试 20×50ms 后仍失败: {}", windows::core::Error::from_thread());
+            return Err(windows::core::Error::new(windows::core::HRESULT(0x8007_0005u32 as i32), msg));
+        }
+        let r = (|| -> Result<(), String> {
+            EmptyClipboard().map_err(|e| format!("EmptyClipboard: {e}"))?;
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             wide.push(0);
             let bytes = wide.len() * 2;
-            let h = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|e| format!("GlobalAlloc: {e}"))?;
             let ptr = GlobalLock(h) as *mut u16;
             if ptr.is_null() {
                 let _ = GlobalFree(Some(h));
-                return Err(windows::core::Error::from_thread());
+                return Err("GlobalLock: null".into());
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(h);
@@ -194,11 +228,11 @@ fn write_clipboard_text(text: &str) -> windows::core::Result<()> {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     let _ = GlobalFree(Some(h));
-                    Err(e)
+                    Err(format!("SetClipboardData: {e}"))
                 }
             }
         })();
         let _ = CloseClipboard();
-        r
+        r.map_err(|s| windows::core::Error::new(windows::core::HRESULT(0x8007_0005u32 as i32), s))
     }
 }

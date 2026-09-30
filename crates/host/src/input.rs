@@ -153,6 +153,21 @@ pub fn cursor_pos() -> (i32, i32) {
     (pt.x, pt.y)
 }
 
+/// M3 运维工具：注入一次鼠标左键点击（绝对坐标）。`host --click x y`
+/// 供主控端经 SSH 把远端焦点点到位（如测试时把记事本点成前台）。
+pub fn click(x: u32, y: u32) {
+    let _ = inject(&rdlink_proto::InputEvent::MouseMove { x, y });
+    let _ = inject(&rdlink_proto::InputEvent::MouseButton {
+        button: rdlink_proto::MouseButton::Left,
+        down: true,
+    });
+    let _ = inject(&rdlink_proto::InputEvent::MouseButton {
+        button: rdlink_proto::MouseButton::Left,
+        down: false,
+    });
+    println!("已点击 ({x},{y})");
+}
+
 fn key_down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
 }

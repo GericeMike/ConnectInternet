@@ -17,6 +17,22 @@ fn main() {
         Some("--encode-demo") => capture::encode_demo(),
         Some("--list-monitors") => capture::list_monitors(),
         Some("--input-demo") => input::input_demo(),
+        Some("--set-clip") => {
+            let text = args.get(2).cloned().unwrap_or_default();
+            match clipboard::write_clipboard_text(&text) {
+                Ok(()) => println!("已写入剪贴板（{} 字节）", text.len()),
+                Err(e) => println!("写入失败: {e}"),
+            }
+        }
+        Some("--get-clip") => match clipboard::read_clipboard_text() {
+            Some(t) => println!("{t}"),
+            None => println!("(空/读取失败)"),
+        },
+        Some("--click") => {
+            let x: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let y: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            input::click(x, y);
+        }
         _ => serve::run(), // 正常运行模式（T7 视频 + T8 输入注入待接）
     }
 }
