@@ -14,4 +14,5 @@ pub mod session;
 
 pub use frame::{read_frame, read_frame_of, write_frame, write_frame_of, FrameError};
 pub use quinn;
+pub use quinn::{RecvStream, SendStream};
 pub use session::{connect, ClientSession, HostListener, HostSession, SessionError};

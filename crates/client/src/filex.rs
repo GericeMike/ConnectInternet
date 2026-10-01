@@ -150,41 +150,55 @@ pub async fn debug_upload(conn: quinn::Connection, path: PathBuf) -> Result<(), 
     do_upload(&conn, path, false).await
 }
 
-/// M3-4 调试/运维：列被控端进程
-pub async fn debug_procs(conn: quinn::Connection) -> Result<Vec<rdlink_proto::ProcEntry>, String> {
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| format!("开流失败: {e}"))?;
-    write_frame_of(
-        &mut send,
-        &Message::Control(ControlMsg::ProcListReq),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let reply: Option<Message> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
-    match reply {
-        Some(Message::Control(ControlMsg::ProcListReply { entries })) => Ok(entries),
-        other => Err(format!("进程列表应答异常: {other:?}")),
+/// M3-4 调试/运维：列被控端进程（走控制流；跳过途中的 Pong）
+pub async fn debug_procs(
+    send: &tokio::sync::Mutex<rdlink_transport::SendStream>,
+    recv: &tokio::sync::Mutex<rdlink_transport::RecvStream>,
+) -> Result<Vec<rdlink_proto::ProcEntry>, String> {
+    {
+        let mut s = send.lock().await;
+        write_frame_of(&mut s, &Message::Control(ControlMsg::ProcListReq))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    loop {
+        let reply: Option<Message> = {
+            let mut r = recv.lock().await;
+            read_frame_of(&mut r).await.map_err(|e| e.to_string())?
+        };
+        match reply {
+            Some(Message::Control(ControlMsg::ProcListReply { entries })) => return Ok(entries),
+            Some(_) => continue, // 途中的 Pong 等
+            None => return Err("连接中断".into()),
+        }
     }
 }
 
 /// M3-4 调试/运维：结束被控端进程
-pub async fn debug_kill(conn: quinn::Connection, pid: u32) -> Result<(), String> {
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| format!("开流失败: {e}"))?;
-    write_frame_of(&mut send, &Message::Control(ControlMsg::ProcKill { pid }))
-        .await
-        .map_err(|e| e.to_string())?;
-    let reply: Option<Message> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
-    match reply {
-        Some(Message::Control(ControlMsg::ProcKillResult { ok: true, .. })) => Ok(()),
-        Some(Message::Control(ControlMsg::ProcKillResult { reason, .. })) => {
-            Err(if reason.is_empty() { "失败".into() } else { reason })
+pub async fn debug_kill(
+    send: &tokio::sync::Mutex<rdlink_transport::SendStream>,
+    recv: &tokio::sync::Mutex<rdlink_transport::RecvStream>,
+    pid: u32,
+) -> Result<(), String> {
+    {
+        let mut s = send.lock().await;
+        write_frame_of(&mut s, &Message::Control(ControlMsg::ProcKill { pid }))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    loop {
+        let reply: Option<Message> = {
+            let mut r = recv.lock().await;
+            read_frame_of(&mut r).await.map_err(|e| e.to_string())?
+        };
+        match reply {
+            Some(Message::Control(ControlMsg::ProcKillResult { ok: true, .. })) => return Ok(()),
+            Some(Message::Control(ControlMsg::ProcKillResult { reason, .. })) => {
+                return Err(if reason.is_empty() { "失败".into() } else { reason })
+            }
+            Some(_) => continue,
+            None => return Err("连接中断".into()),
         }
-        other => Err(format!("结束应答异常: {other:?}")),
     }
 }
 

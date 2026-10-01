@@ -32,34 +32,43 @@ fn toml_conn() -> (std::net::SocketAddr, String, Option<String>) {
     )
 }
 
-async fn connected_session() -> quinn::Connection {
+async fn connected_session() -> (
+    quinn::Connection,
+    std::sync::Arc<tokio::sync::Mutex<rdlink_transport::SendStream>>,
+    std::sync::Arc<tokio::sync::Mutex<rdlink_transport::RecvStream>>,
+) {
     let (addr, pin, password) = toml_conn();
     let session = connect(addr, &pin, "rdlink-cmd", password.as_deref())
         .await
         .expect("连接被控端失败");
     println!("已连接: {}（会话保持中，500ms 心跳）", session.peer_name);
-    // host 3s 无 Ping 看门狗需要心跳；顺带消费 Pong/control 消息防流积压
+    // host 3s 无 Ping 看门狗需要心跳；顺带消费 Pong/control 消息防流积压。
+    // 控制流用 Arc<Mutex> 共享：心跳任务与请求代码都在其上收发。
     let rdlink_transport::ClientSession {
-        control_send: mut cs,
-        control_recv: mut cr,
+        control_send,
+        control_recv,
         connection,
         ..
     } = session;
-    tokio::spawn(async move {
-        loop {
-            if write_frame(&mut cs, &Message::Control(ControlMsg::Ping { t_us: 0 }))
-                .await
-                .is_err()
-            {
-                break;
+    let cs = std::sync::Arc::new(tokio::sync::Mutex::new(control_send));
+    let cr = std::sync::Arc::new(tokio::sync::Mutex::new(control_recv));
+    {
+        let cs = cs.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut cs = cs.lock().await;
+                if write_frame(&mut cs, &Message::Control(ControlMsg::Ping { t_us: 0 }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                drop(cs);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    });
-    tokio::spawn(async move {
-        while let Ok(Some(_)) = read_frame(&mut cr).await {}
-    });
-    connection
+        });
+    }
+    (connection, cs, cr)
 }
 
 pub fn run_upload(path: String) {
@@ -68,7 +77,7 @@ pub fn run_upload(path: String) {
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let conn = connected_session().await;
+        let (conn, _cs, _cr) = connected_session().await;
         match crate::filex::debug_upload(conn, path.into()).await {
             Ok(()) => println!("上传完成"),
             Err(e) => {
@@ -85,7 +94,7 @@ pub fn run_download(name: String) {
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let conn = connected_session().await;
+        let (conn, _cs, _cr) = connected_session().await;
         match crate::filex::debug_download(conn, name).await {
             Ok(dest) => println!("下载完成 → {}", dest.display()),
             Err(e) => {
@@ -103,8 +112,8 @@ pub fn run_procs() {
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let conn = connected_session().await;
-        match crate::filex::debug_procs(conn).await {
+        let (_conn, cs, cr) = connected_session().await;
+        match crate::filex::debug_procs(&cs, &cr).await {
             Ok(entries) => {
                 println!("{:<8} {:<28} {:>8} {:>10}", "PID", "名称", "CPU%", "内存MB");
                 for e in entries.iter().take(40) {
@@ -127,8 +136,8 @@ pub fn run_kill(pid: u32) {
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let conn = connected_session().await;
-        match crate::filex::debug_kill(conn, pid).await {
+        let (_conn, cs, cr) = connected_session().await;
+        match crate::filex::debug_kill(&cs, &cr, pid).await {
             Ok(()) => println!("已结束进程 {pid}"),
             Err(e) => {
                 eprintln!("结束失败: {e}");
