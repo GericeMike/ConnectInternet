@@ -22,3 +22,4 @@ out.extradata.bin
 capture-*.png
 host-run.log
 rdlink.local.toml
+host-local-test.log

@@ -213,7 +213,7 @@ pub async fn connect(
         cert::client_crypto(pin).map_err(|e| SessionError::Handshake(e.to_string()))?,
     )
     .map_err(|e| SessionError::Handshake(e.to_string()))?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
     // M3-2：下载吞吐——client 是下载方向的接收方，通告大接收窗口
     {
         let mut tp = quinn::TransportConfig::default();
