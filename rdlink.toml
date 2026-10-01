@@ -1,0 +1,11 @@
+# rdlink 配置（两端各有一份；被控端可另建 rdlink.local.toml 覆盖，不入库）
+
+[host]
+port = 9527
+cert_dir = "certs"
+
+[client]
+vsync = false
+# 无参数启动 client 时使用的默认连接（主控端连被控端）
+host = "192.168.10.3:9527"
+fingerprint = "536ecdd88099177f0c6f3ba9a3789deafa8347bed18cc81adede537f1270f57b"

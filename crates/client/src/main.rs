@@ -35,9 +35,29 @@ fn main() {
             stream::run(&addr, &pin);
         }
         _ => {
-            println!("rdlink-client {} (主控端)", env!("CARGO_PKG_VERSION"));
-            println!("运行模式: client --host <ip:port> <指纹>");
-            println!("辅助: --render-demo [vsync] | --decode-demo <文件>");
+            // 无参数：从 rdlink.toml [client] 读默认连接（host + fingerprint），
+            // 支持双击 连接被控端.bat 直接启动
+            #[derive(serde::Deserialize, Default)]
+            #[serde(default)]
+            struct DefaultConn {
+                host: Option<String>,
+                fingerprint: Option<String>,
+            }
+            let conn: DefaultConn = std::fs::read_to_string("rdlink.toml")
+                .ok()
+                .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+                .and_then(|v| v.get("client").cloned())
+                .and_then(|c| c.try_into::<DefaultConn>().ok())
+                .unwrap_or_default();
+            match (conn.host, conn.fingerprint) {
+                (Some(addr), Some(pin)) => stream::run(&addr, &pin),
+                _ => {
+                    println!("rdlink-client {} (主控端)", env!("CARGO_PKG_VERSION"));
+                    println!("运行模式: client --host <ip:port> <指纹>");
+                    println!("或在 rdlink.toml [client] 配置 host + fingerprint 后无参数启动");
+                    println!("辅助: --render-demo [vsync] | --decode-demo <文件>");
+                }
+            }
         }
     }
 }
