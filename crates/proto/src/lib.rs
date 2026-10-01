@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 /// v3: ControlMsg 加 ClipboardSync（M3-1 剪贴板同步）
 /// v4: FileMsg::Request 加 to_view（M3-2 拖拽落前台 Explorer 文件夹/桌面）
 /// v5: ControlMsg 加 ClipboardImage（M3-6 截图/图片剪贴板同步，PNG 编码传输）
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: ControlMsg 加 PowerAction（M3-3 电源控制）
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -65,6 +66,10 @@ pub enum ControlMsg {
     /// png 为 RGBA 转 PNG 的编码结果（无损回环比对：两端都以 RGBA 像素做指纹）。
     /// 上限 8 MiB，超限发送方直接丢弃。
     ClipboardImage { hash: u64, width: u32, height: u32, png: Vec<u8> },
+    /// client → host（M3-3）：电源动作。host 执行后：Lock 立即生效；Sleep 机器待机
+    /// （唤醒需物理按键，除非配置了唤醒源）；Shutdown/Restart 连接随之断开
+    /// （Restart 后 host 随登录自启，client 自动重连）。
+    PowerAction { action: PowerActionKind },
 }
 
 /// FNV-1a 64 位内容指纹（M3-1 剪贴板回环抑制用）
@@ -125,6 +130,15 @@ pub struct FileEntry {
 pub enum XferDir {
     Up,
     Down,
+}
+
+/// M3-3：电源动作类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PowerActionKind {
+    Lock,
+    Sleep,
+    Shutdown,
+    Restart,
 }
 
 /// 一帧编码后的 H.264 数据。

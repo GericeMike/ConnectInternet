@@ -6,6 +6,7 @@ mod encoder;
 mod filex;
 mod gpu;
 mod input;
+mod power;
 mod serve;
 mod shellfolder;
 

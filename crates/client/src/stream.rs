@@ -250,11 +250,13 @@ async fn stream_loop(
             SessionExit::User => {
                 *input_tx_slot.lock().unwrap() = None;
                 crate::filex::clear_connection();
+                crate::panel::clear_power_tx();
                 return;
             }
             SessionExit::Lost => {
                 *input_tx_slot.lock().unwrap() = None;
                 crate::filex::clear_connection();
+                crate::panel::clear_power_tx();
                 attempt += 1; // 退避从 1s 起
             }
         }
@@ -283,6 +285,10 @@ async fn session_run(
         mut input,
         connection: _,
     } = session;
+
+    // M3-3：电源动作出口注入面板（面板按钮 → 通道 → ping 任务顺带发送）
+    let (power_tx, mut power_rx) = mpsc::unbounded_channel::<rdlink_proto::PowerActionKind>();
+    crate::panel::set_power_tx(power_tx);
 
     // 记录 host 分辨率（输入坐标映射用）
     if let ControlMsg::VideoStreamInfo { width, height, .. } = &video_info {
@@ -370,6 +376,23 @@ async fn session_run(
                         )
                         .await;
                         break;
+                    }
+                    // M3-3：面板电源动作
+                    action = power_rx.recv() => {
+                        match action {
+                            Some(a) => {
+                                if write_frame(
+                                    &mut control_send,
+                                    &Message::Control(ControlMsg::PowerAction { action: a }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
                     }
                     // M3-1/M3-6：本端剪贴板变化（文本或图片）→ 同步给 host
                     _ = clip_rx.changed() => {

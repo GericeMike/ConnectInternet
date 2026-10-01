@@ -11,7 +11,7 @@
 //! - M3-3/4/5 的控件（电源/进程/密码框）继续作为子控件挂进本窗口。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use windows::Win32::Foundation::{HWND, LRESULT};
 
@@ -26,6 +26,30 @@ static LIST_HWND: AtomicUsize = AtomicUsize::new(0);
 static STATUS_HWND: AtomicUsize = AtomicUsize::new(0);
 /// host Downloads 文件列表缓存（(名称, 大小)，下载按钮按选中行取）
 static FILE_LIST: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+/// 电源动作出口（stream.rs 会话建立时注入，断开时清除）
+static POWER_TX: RwLock<Option<tokio::sync::mpsc::UnboundedSender<rdlink_proto::PowerActionKind>>> =
+    RwLock::new(None);
+/// 重启/关机的两段式确认状态（按钮 id + 按下时刻）
+static CONFIRM_ARMED: Mutex<Option<(i32, std::time::Instant)>> = Mutex::new(None);
+
+/// stream.rs 会话建立时注入电源动作出口
+pub fn set_power_tx(tx: tokio::sync::mpsc::UnboundedSender<rdlink_proto::PowerActionKind>) {
+    *POWER_TX.write().unwrap() = Some(tx);
+}
+
+/// 会话结束清除
+pub fn clear_power_tx() {
+    *POWER_TX.write().unwrap() = None;
+}
+
+fn submit_power(action: rdlink_proto::PowerActionKind) {
+    match POWER_TX.read().unwrap().as_ref() {
+        Some(tx) => {
+            let _ = tx.send(action);
+        }
+        None => set_status("状态：未连接，电源动作不可用"),
+    }
+}
 
 const HOTKEY_TOGGLE: i32 = 1;
 /// Ctrl+Alt+U
@@ -39,7 +63,12 @@ const IDC_FILE_LIST: i32 = 101;
 const IDC_BTN_REFRESH: i32 = 102;
 const IDC_BTN_DOWNLOAD: i32 = 103;
 const IDC_STATUS: i32 = 104;
+const IDC_PWR_LOCK: i32 = 110;
+const IDC_PWR_SLEEP: i32 = 111;
+const IDC_PWR_RESTART: i32 = 112;
+const IDC_PWR_SHUTDOWN: i32 = 113;
 const TIMER_DRAIN: usize = 1;
+const CONFIRM_WINDOW_SECS: u64 = 5;
 
 /// 启动面板线程（热键 + 面板窗口 + 消息循环）。进程生命周期内常驻。
 pub fn spawn() {
@@ -181,6 +210,57 @@ fn panel_thread() -> Result<(), String> {
             24,
             IDC_STATUS,
         )?;
+        // M3-3 电源区：锁屏/睡眠立即执行；重启/关机两段式确认
+        child(
+            windows::core::w!("电源（重启/关机需二次确认）："),
+            windows::core::w!("STATIC"),
+            CHILD,
+            16,
+            318,
+            390,
+            22,
+            0,
+        )?;
+        child(
+            windows::core::w!("锁屏"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            16,
+            344,
+            92,
+            28,
+            IDC_PWR_LOCK,
+        )?;
+        child(
+            windows::core::w!("睡眠"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            114,
+            344,
+            92,
+            28,
+            IDC_PWR_SLEEP,
+        )?;
+        child(
+            windows::core::w!("重启"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            212,
+            344,
+            92,
+            28,
+            IDC_PWR_RESTART,
+        )?;
+        child(
+            windows::core::w!("关机"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            310,
+            344,
+            92,
+            28,
+            IDC_PWR_SHUTDOWN,
+        )?;
         // 状态行句柄（进度/状态文本刷新用）
         let status = GetDlgItem(Some(hwnd), IDC_STATUS).unwrap_or_default();
         STATUS_HWND.store(status.0 as usize, Ordering::SeqCst);
@@ -237,6 +317,44 @@ fn set_status(text: &str) {
     }
 }
 
+fn set_button_text(id: i32, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetDlgItem, SetWindowTextW};
+    unsafe {
+        let hwnd = HWND(PANEL_HWND.load(Ordering::SeqCst) as _);
+        if hwnd.is_invalid() {
+            return;
+        }
+        let ctl = GetDlgItem(Some(hwnd), id).unwrap_or_default();
+        if !ctl.is_invalid() {
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            let _ = SetWindowTextW(ctl, windows::core::PCWSTR(wide.as_ptr()));
+        }
+    }
+}
+
+/// 重启/关机两段式确认：第一次点进入待确认（按钮变"确认？再点一次"），
+/// CONFIRM_WINDOW_SECS 内再点才真正发送；超时自动还原。
+fn power_confirm(id: i32, confirm_text: &str, fire: impl FnOnce()) {
+    let mut armed = CONFIRM_ARMED.lock().unwrap();
+    match armed.as_ref() {
+        Some((aid, _)) if *aid == id => {
+            *armed = None;
+            drop(armed);
+            fire();
+            let label = match id {
+                IDC_PWR_RESTART => "重启",
+                IDC_PWR_SHUTDOWN => "关机",
+                _ => "?",
+            };
+            set_button_text(id, label);
+        }
+        _ => {
+            *armed = Some((id, std::time::Instant::now()));
+            set_button_text(id, confirm_text);
+        }
+    }
+}
+
 unsafe extern "system" fn panel_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
@@ -271,11 +389,46 @@ unsafe extern "system" fn panel_wndproc(
                             set_status("状态：请先在列表中选择要下载的文件");
                         }
                     }
+                    IDC_PWR_LOCK => {
+                        submit_power(rdlink_proto::PowerActionKind::Lock);
+                        set_status("状态：已发送锁屏命令");
+                    }
+                    IDC_PWR_SLEEP => {
+                        submit_power(rdlink_proto::PowerActionKind::Sleep);
+                        set_status("状态：已发送睡眠命令（唤醒需在被控端按电源键）");
+                    }
+                    IDC_PWR_RESTART => {
+                        power_confirm(IDC_PWR_RESTART, "确认重启？再点一次", || {
+                            submit_power(rdlink_proto::PowerActionKind::Restart);
+                            set_status("状态：已发送重启命令（被控端重启后自动恢复连接）");
+                        });
+                    }
+                    IDC_PWR_SHUTDOWN => {
+                        power_confirm(IDC_PWR_SHUTDOWN, "确认关机？再点一次", || {
+                            submit_power(rdlink_proto::PowerActionKind::Shutdown);
+                            set_status("状态：已发送关机命令");
+                        });
+                    }
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 as usize == TIMER_DRAIN => {
+                // 确认状态超时（5s）→ 按钮文案还原
+                {
+                    let mut armed = CONFIRM_ARMED.lock().unwrap();
+                    if let Some((id, at)) = armed.as_ref() {
+                        if at.elapsed().as_secs() >= CONFIRM_WINDOW_SECS {
+                            let label = match *id {
+                                IDC_PWR_RESTART => "重启",
+                                IDC_PWR_SHUTDOWN => "关机",
+                                _ => "?",
+                            };
+                            set_button_text(*id, label);
+                            *armed = None;
+                        }
+                    }
+                }
                 drain_filex_events();
                 LRESULT(0)
             }

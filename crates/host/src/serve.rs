@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use rdlink_proto::{ControlMsg, Message, VideoFrame};
+use rdlink_proto::{ControlMsg, Message, PowerActionKind, VideoFrame};
 use rdlink_transport::{read_frame, write_frame, HostListener, HostSession};
 use tokio::sync::mpsc;
 
@@ -402,6 +402,20 @@ async fn serve_session_inner(
                         }
                         None => eprintln!("[clip] 对端图片 PNG 解码失败"),
                     }
+                }
+            }
+            Ok(Some(Message::Control(ControlMsg::PowerAction { action }))) => {
+                // M3-3：电源动作。Shutdown/Restart 执行后连接/机器随之下线，
+                // 无需也无处回复——同步执行（毫秒级），不阻塞控制循环。
+                let name = match action {
+                    PowerActionKind::Lock => "锁屏",
+                    PowerActionKind::Sleep => "睡眠",
+                    PowerActionKind::Shutdown => "关机",
+                    PowerActionKind::Restart => "重启",
+                };
+                println!("[power] 收到电源动作: {name}，执行…");
+                if let Err(e) = crate::power::execute(action) {
+                    eprintln!("[power] {name} 执行失败: {e}");
                 }
             }
             Ok(Some(_)) => {}
