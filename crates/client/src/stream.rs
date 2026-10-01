@@ -611,11 +611,14 @@ impl ApplicationHandler for StreamApp {
                 });
             }
 
-            // M3-2：拖文件进窗口 = 上传到被控端 Downloads
+            // M3-2：拖文件进窗口 = 上传到被控端（落点跟随前台 Explorer/桌面）
             WindowEvent::DroppedFile(path_buf) => {
                 let p = path_buf.clone();
                 println!("[file] 拖入文件: {}", p.display());
-                if !crate::filex::submit(crate::filex::XferRequest::Upload(p)) {
+                if !crate::filex::submit(crate::filex::XferRequest::Upload {
+                    path: p,
+                    to_view: true,
+                }) {
                     println!("[file] 传输管理未就绪（client 初始化中）");
                 }
             }

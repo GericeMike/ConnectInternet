@@ -214,13 +214,9 @@ pub async fn connect(
     )
     .map_err(|e| SessionError::Handshake(e.to_string()))?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
-    // M3-2：下载吞吐——client 是下载方向的接收方，通告大接收窗口
-    {
-        let mut tp = quinn::TransportConfig::default();
-        tp.stream_receive_window(quinn::VarInt::from_u64(8 * 1024 * 1024).expect("varint"));
-        tp.receive_window(quinn::VarInt::from_u64(16 * 1024 * 1024).expect("varint"));
-        client_config.transport_config(Arc::new(tp));
-    }
+    // 注意：不要给 client 调大收流窗口——视频方向（host→client）的在途缓冲
+    // 会随之膨胀成秒级延迟（8MiB@50Mbps ≈ 1.3s，实测教训）；默认 1MiB ≈ 160ms
+    // 上限才是低延迟正确值。文件下载是链路瓶颈（scp 基线对比），大窗口无收益。
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| SessionError::Io(e.to_string()))?;

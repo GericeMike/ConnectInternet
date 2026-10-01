@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 /// 协议版本号。两端 Hello 阶段校验，不一致则拒绝连接。
 /// v2: VideoFrame 加 encode_us；Pong 加 host_recv_us/host_send_us（T9 打点）
 /// v3: ControlMsg 加 ClipboardSync（M3-1 剪贴板同步）
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: FileMsg::Request 加 to_view（M3-2 拖拽落前台 Explorer 文件夹/桌面）
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -83,8 +84,11 @@ pub enum FileMsg {
     ListReq { path: String },
     /// host → client：目录列表
     ListReply { entries: Vec<FileEntry> },
-    /// client → host：发起传输
-    Request { dir: XferDir, name: String, size: u64 },
+    /// client → host：发起传输。
+    /// to_view=true（拖拽上传）：落到被控端**前台 Explorer 正在显示的文件夹**，
+    ///   前台是桌面则落桌面，都不是则落 Downloads 兜底；
+    /// to_view=false（脚本/运维上传）：固定落 Downloads。
+    Request { dir: XferDir, name: String, size: u64, to_view: bool },
     /// host → client：接受
     Accept,
     /// host → client：拒绝（路径非法/大小不符/IO）

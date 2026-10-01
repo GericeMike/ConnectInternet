@@ -20,7 +20,8 @@ use rdlink_transport::{read_frame_of, write_frame_of};
 
 #[derive(Debug, Clone)]
 pub enum XferRequest {
-    Upload(PathBuf),
+    /// 拖拽上传（落点跟随被控端前台 Explorer/桌面）
+    Upload { path: PathBuf, to_view: bool },
     Download { name: String, size: u64 },
     Refresh,
 }
@@ -87,7 +88,7 @@ pub fn spawn_manager() {
             }
             let r = match req {
                 XferRequest::Refresh => do_list(&conn).await,
-                XferRequest::Upload(path) => do_upload(&conn, path).await,
+                XferRequest::Upload { path, to_view } => do_upload(&conn, path, to_view).await,
                 XferRequest::Download { name, size } => do_download(&conn, name, size).await,
             };
             BUSY.store(false, Ordering::SeqCst);
@@ -137,9 +138,9 @@ pub async fn debug_download(conn: quinn::Connection, name: String) -> Result<Pat
     Ok(client_downloads_dir().join(name))
 }
 
-/// 调试/运维：上传本地文件到被控端 Downloads
+/// 调试/运维：上传本地文件到被控端 Downloads（不跟随前台文件夹）
 pub async fn debug_upload(conn: quinn::Connection, path: PathBuf) -> Result<(), String> {
-    do_upload(&conn, path).await
+    do_upload(&conn, path, false).await
 }
 
 /// 主控端下载落地目录：rdlink.toml [client] download_dir 覆盖，默认 Downloads
@@ -184,7 +185,7 @@ fn human(bytes: u64) -> String {
     }
 }
 
-async fn do_upload(conn: &quinn::Connection, path: PathBuf) -> Result<(), String> {
+async fn do_upload(conn: &quinn::Connection, path: PathBuf, to_view: bool) -> Result<(), String> {
     let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
     if meta.is_dir() {
         return Err("暂不支持整个文件夹（请拖单个文件）".into());
@@ -198,9 +199,12 @@ async fn do_upload(conn: &quinn::Connection, path: PathBuf) -> Result<(), String
     let mut file = std::fs::File::open(&path).map_err(|e| format!("打开文件失败: {e}"))?;
 
     let (mut send, mut recv) = open_stream(conn).await?;
-    write_frame_of(&mut send, &FileMsg::Request { dir: XferDir::Up, name: name.clone(), size })
-        .await
-        .map_err(|e| e.to_string())?;
+    write_frame_of(
+        &mut send,
+        &FileMsg::Request { dir: XferDir::Up, name: name.clone(), size, to_view },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let ack: Option<FileMsg> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
     match ack {
         Some(FileMsg::Accept) => {}
@@ -264,9 +268,12 @@ async fn do_upload(conn: &quinn::Connection, path: PathBuf) -> Result<(), String
 
 async fn do_download(conn: &quinn::Connection, name: String, size: u64) -> Result<(), String> {
     let (mut send, mut recv) = open_stream(conn).await?;
-    write_frame_of(&mut send, &FileMsg::Request { dir: XferDir::Down, name: name.clone(), size })
-        .await
-        .map_err(|e| e.to_string())?;
+    write_frame_of(
+        &mut send,
+        &FileMsg::Request { dir: XferDir::Down, name: name.clone(), size, to_view: false },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let ack: Option<FileMsg> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
     match ack {
         Some(FileMsg::Accept) => {}

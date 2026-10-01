@@ -58,10 +58,10 @@ async fn handle_stream(
             let _ = send.finish();
             Ok(())
         }
-        Some(FileMsg::Request { dir: XferDir::Up, name, size }) => {
-            upload(&mut recv, &mut send, name, size).await
+        Some(FileMsg::Request { dir: XferDir::Up, name, size, to_view }) => {
+            upload(&mut recv, &mut send, name, size, to_view).await
         }
-        Some(FileMsg::Request { dir: XferDir::Down, name, size }) => {
+        Some(FileMsg::Request { dir: XferDir::Down, name, size, .. }) => {
             download(&mut recv, &mut send, name, size).await
         }
         other => Err(format!("文件流首帧非法: {other:?}")),
@@ -133,6 +133,7 @@ async fn upload(
     send: &mut quinn::SendStream,
     name: String,
     size: u64,
+    to_view: bool,
 ) -> Result<(), String> {
     let Some(name) = safe_name(&name) else {
         write_frame_of(send, &FileMsg::Reject { reason: "非法文件名".into() })
@@ -140,7 +141,13 @@ async fn upload(
             .map_err(|e| e.to_string())?;
         return Err("上传被拒: 非法文件名".into());
     };
-    let dir = downloads_dir();
+    // 落点：to_view 时跟随被控端前台 Explorer/桌面正在显示的文件夹，否则 Downloads
+    let dir = if to_view {
+        crate::shellfolder::foreground_view_folder()
+            .unwrap_or_else(downloads_dir)
+    } else {
+        downloads_dir()
+    };
     let _ = std::fs::create_dir_all(&dir);
     let path = dedup_path(&dir, &name);
     println!("[file] 上传开始: {}（{} B）→ {}", name, size, path.display());

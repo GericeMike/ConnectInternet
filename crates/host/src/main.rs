@@ -7,6 +7,7 @@ mod filex;
 mod gpu;
 mod input;
 mod serve;
+mod shellfolder;
 
 use ffmpeg_the_third as ffmpeg;
 
