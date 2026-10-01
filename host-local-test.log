@@ -1,0 +1,23 @@
+rdlink-host 已就绪
+监听: 0.0.0.0:9527
+证书指纹（填给 client）: 114ab55c85ac336b203e334626e641adb70e2276f6c88d178009034aa78340ee
+主控端已连接: rdlink-client（1920x1080）
+[capture] 启动分段: WGC 激活 200ms | 编码器打开 161ms（h264_nvenc）@ 1920x1080
+[session] 会话启动: 会话开始→捕获就绪 436ms
+[gpu] 着色器 NV12 转换器就绪（GPU 路径生效）
+[gpu] 探针#1: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[capture] 首帧就绪: 线程启动→首帧入队 459ms（本帧编码 3ms）
+[gpu] 探针#91: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[gpu] 探针#181: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[gpu] 探针#271: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[stats] 5.0s: 58.3fps | GPU转+读 p50=0.8ms（NV12 via GPU） | 编码 p50=2.5ms p95=3.2ms | 待发队列 1 | 丢帧 0 | 累计 292 包（h264_nvenc）
+[send] 59fps | capture→send 平均 3ms / 最大 15ms
+[gpu] 探针#361: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[gpu] 探针#451: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[gpu] 探针#541: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+[stats] 10.0s: 58.4fps | GPU转+读 p50=1.1ms（NV12 via GPU） | 编码 p50=3.6ms p95=5.0ms | 待发队列 5 | 丢帧 21 | 累计 585 包（h264_nvenc）
+[gpu] 探针#631: Y 非零 100% / UV 非零 100%（直连SRV 路径）
+主控端失联（3s 无 Ping），回收会话
+[session] 编码器已归缓存
+会话结束，等待下一个主控端…
+video 流写入失败（主控端断开?）: 网络错误: connection lost

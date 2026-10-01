@@ -75,7 +75,7 @@ impl HostListener {
             .map_err(|e| SessionError::Io(e.to_string()))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-                .map_err(|e| SessionError::Io(e.to_string()))?,
+                .map_err(|e| SessionError::Handshake(e.to_string()))?,
         ));
         // 对端异常消失（进程被杀/断电，无 CONNECTION_CLOSE）时的兜底：
         // 默认 30s 太长——期间 accept 循环阻塞在会话回收上，新连接进不来
@@ -85,6 +85,9 @@ impl HostListener {
                 quinn::IdleTimeout::try_from(std::time::Duration::from_secs(10))
                     .expect("idle timeout"),
             ));
+            // M3-2：文件传输吞吐——收流窗口给大（接收方在此通告自己的接收能力）
+            tp.stream_receive_window(quinn::VarInt::from_u64(8 * 1024 * 1024).expect("varint"));
+            tp.receive_window(quinn::VarInt::from_u64(16 * 1024 * 1024).expect("varint"));
             server_config.transport_config(Arc::new(tp));
         }
 
@@ -211,6 +214,13 @@ pub async fn connect(
     )
     .map_err(|e| SessionError::Handshake(e.to_string()))?;
     let client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+    // M3-2：下载吞吐——client 是下载方向的接收方，通告大接收窗口
+    {
+        let mut tp = quinn::TransportConfig::default();
+        tp.stream_receive_window(quinn::VarInt::from_u64(8 * 1024 * 1024).expect("varint"));
+        tp.receive_window(quinn::VarInt::from_u64(16 * 1024 * 1024).expect("varint"));
+        client_config.transport_config(Arc::new(tp));
+    }
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| SessionError::Io(e.to_string()))?;
