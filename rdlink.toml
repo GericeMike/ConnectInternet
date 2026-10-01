@@ -5,6 +5,7 @@ port = 9527
 cert_dir = "certs"
 
 [client]
+password = "rdlink-test-123"
 vsync = false
 # 无参数启动 client 时使用的默认连接（主控端连被控端）
 host = "192.168.10.3:9527"
