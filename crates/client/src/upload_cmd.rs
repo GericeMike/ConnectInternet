@@ -95,3 +95,45 @@ pub fn run_download(name: String) {
         }
     });
 }
+
+/// M3-4 调试/运维：列出被控端进程
+pub fn run_procs() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let conn = connected_session().await;
+        match crate::filex::debug_procs(conn).await {
+            Ok(entries) => {
+                println!("{:<8} {:<28} {:>8} {:>10}", "PID", "名称", "CPU%", "内存MB");
+                for e in entries.iter().take(40) {
+                    println!("{:<8} {:<28} {:>8.1} {:>10.0}", e.pid, e.name, e.cpu, e.mem_mb);
+                }
+                println!("（共 {} 项，仅显示前 40）", entries.len());
+            }
+            Err(e) => {
+                eprintln!("进程列表失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+/// M3-4 调试/运维：结束指定进程
+pub fn run_kill(pid: u32) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let conn = connected_session().await;
+        match crate::filex::debug_kill(conn, pid).await {
+            Ok(()) => println!("已结束进程 {pid}"),
+            Err(e) => {
+                eprintln!("结束失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+}

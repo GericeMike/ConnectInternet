@@ -48,6 +48,20 @@ fn main() {
             let name = args.get(2).cloned().ok_or("用法: client --download <文件名>").unwrap();
             upload_cmd::run_download(name);
         }
+        // M3-4 调试/运维：client --procs（列被控端进程）/ --kill <pid>
+        Some("--procs") => {
+            upload_cmd::run_procs();
+        }
+        Some("--kill") => {
+            let pid: u32 = match args.get(2).and_then(|s| s.parse().ok()) {
+                Some(p) => p,
+                None => {
+                    eprintln!("用法: client --kill <pid>");
+                    std::process::exit(2);
+                }
+            };
+            upload_cmd::run_kill(pid);
+        }
         _ => {
             // 无参数：从 rdlink.toml [client] 读默认连接（host + fingerprint），
             // 支持双击 连接被控端.bat 直接启动

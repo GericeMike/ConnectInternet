@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
-use rdlink_proto::{FileEntry, FileMsg, XferDir};
+use rdlink_proto::{ControlMsg, FileEntry, FileMsg, Message, XferDir};
 use rdlink_transport::quinn;
 use rdlink_transport::{read_frame_of, write_frame_of};
 
@@ -148,6 +148,44 @@ pub async fn debug_download(conn: quinn::Connection, name: String) -> Result<Pat
 /// 调试/运维：上传本地文件到被控端 Downloads（不跟随前台文件夹）
 pub async fn debug_upload(conn: quinn::Connection, path: PathBuf) -> Result<(), String> {
     do_upload(&conn, path, false).await
+}
+
+/// M3-4 调试/运维：列被控端进程
+pub async fn debug_procs(conn: quinn::Connection) -> Result<Vec<rdlink_proto::ProcEntry>, String> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| format!("开流失败: {e}"))?;
+    write_frame_of(
+        &mut send,
+        &Message::Control(ControlMsg::ProcListReq),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let reply: Option<Message> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
+    match reply {
+        Some(Message::Control(ControlMsg::ProcListReply { entries })) => Ok(entries),
+        other => Err(format!("进程列表应答异常: {other:?}")),
+    }
+}
+
+/// M3-4 调试/运维：结束被控端进程
+pub async fn debug_kill(conn: quinn::Connection, pid: u32) -> Result<(), String> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| format!("开流失败: {e}"))?;
+    write_frame_of(&mut send, &Message::Control(ControlMsg::ProcKill { pid }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let reply: Option<Message> = read_frame_of(&mut recv).await.map_err(|e| e.to_string())?;
+    match reply {
+        Some(Message::Control(ControlMsg::ProcKillResult { ok: true, .. })) => Ok(()),
+        Some(Message::Control(ControlMsg::ProcKillResult { reason, .. })) => {
+            Err(if reason.is_empty() { "失败".into() } else { reason })
+        }
+        other => Err(format!("结束应答异常: {other:?}")),
+    }
 }
 
 /// 主控端下载落地目录：rdlink.toml [client] download_dir 覆盖，默认 Downloads
