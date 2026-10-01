@@ -58,11 +58,18 @@ pub struct HostListener {
     endpoint: Endpoint,
     /// 本机证书指纹（告知主控端用）
     pub fingerprint: String,
+    /// M3-5 密码认证：(argon2 盐 hex, 密钥 K hex)。None = 未启用密码认证
+    auth: Option<(String, String)>,
 }
 
 impl HostListener {
     /// 监听 `addr`（如 `0.0.0.0:9527`），证书从 `cert_dir` 加载或首启生成。
-    pub fn listen(addr: std::net::SocketAddr, cert_dir: &Path) -> Result<Self, SessionError> {
+    /// `auth` = Some((盐 hex, 密钥 K hex)) 时启用密码认证（M3-5）。
+    pub fn listen(
+        addr: std::net::SocketAddr,
+        cert_dir: &Path,
+        auth: Option<(String, String)>,
+    ) -> Result<Self, SessionError> {
         let (cert, key, fingerprint) =
             cert::ensure_host_cert(cert_dir).map_err(|e| SessionError::Io(e.to_string()))?;
 
@@ -93,7 +100,7 @@ impl HostListener {
 
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| SessionError::Io(e.to_string()))?;
-        Ok(Self { endpoint, fingerprint })
+        Ok(Self { endpoint, fingerprint, auth })
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, SessionError> {
@@ -143,6 +150,51 @@ impl HostListener {
             }
             _ => return Err(SessionError::Handshake("期望 Hello".into())),
         };
+
+        // M3-5：密码认证（启用时）——挑战-应答防重放：
+        // K = argon2id(password, salt)（host 存 K hex；client 每次握手现场派生），
+        // proof = hex(sha256(K ‖ nonce))。失败即 Bye 断连。
+        if let Some((salt_hex, key_hex)) = &self.auth {
+            use ring::rand::SystemRandom;
+            let rng = SystemRandom::new();
+            let nonce_b = ring::rand::generate::<[u8; 16]>(&rng)
+                .map_err(|_| SessionError::Handshake("nonce 生成失败".into()))?
+                .expose();
+            let nonce = hex::encode(nonce_b);
+            write_frame(
+                &mut control_send,
+                &Message::Control(ControlMsg::AuthChallenge {
+                    salt: salt_hex.clone(),
+                    nonce: nonce.clone(),
+                }),
+            )
+            .await?;
+            let ok = match read_frame(&mut control_recv).await? {
+                Some(Message::Control(ControlMsg::AuthProof { proof })) => {
+                    let key = hex::decode(key_hex)
+                        .map_err(|_| SessionError::Handshake("host auth_key 非法 hex".into()))?;
+                    let mut input = key;
+                    input.extend_from_slice(&nonce_b);
+                    use sha2::Digest;
+                    let expected = hex::encode(sha2::Sha256::digest(&input));
+                    proof == expected
+                }
+                _ => false,
+            };
+            if !ok {
+                let _ = write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::Bye {
+                        reason: "密码认证失败".into(),
+                    }),
+                )
+                .await;
+                return Err(SessionError::Handshake(format!(
+                    "client 密码认证失败（{}）",
+                    hello.1
+                )));
+            }
+        }
 
         // QUIC 语义：uni 流必须写入首帧对端才可见。
         // 顺序：开 Video 流并立刻写 VideoStreamInfo（首帧激活，携带真实参数）
@@ -203,11 +255,25 @@ pub struct ClientSession {
     pub connection: Connection,
 }
 
+/// M3-5：K = argon2id(password, salt)（32 字节）
+fn derive_key(password: &str, salt_hex: &str) -> Result<Vec<u8>, SessionError> {
+    use argon2::Argon2;
+    let salt = hex::decode(salt_hex)
+        .map_err(|_| SessionError::Handshake("auth salt 非法 hex".into()))?;
+    let mut key = vec![0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .map_err(|e| SessionError::Handshake(format!("KDF 失败: {e}")))?;
+    Ok(key)
+}
+
 /// 连接并完成握手。`pin` 是 host 证书的 SHA-256 指纹（hex）。
+/// `password` = Some 时支持 M3-5 密码认证（被控端启用认证时必须提供）。
 pub async fn connect(
     addr: std::net::SocketAddr,
     pin: &str,
     client_name: &str,
+    password: Option<&str>,
 ) -> Result<ClientSession, SessionError> {
     let quic_client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
         cert::client_crypto(pin).map_err(|e| SessionError::Handshake(e.to_string()))?,
@@ -239,18 +305,42 @@ pub async fn connect(
     )
     .await?;
 
-    // 2. 等 HelloAck（host 在 ack 前已 open Video uni）
-    let ack = match read_frame(&mut control_recv).await? {
-        Some(Message::Control(ControlMsg::HelloAck { proto_version, host_name, .. })) => {
-            if proto_version != PROTOCOL_VERSION {
-                return Err(SessionError::Handshake("host 协议版本不匹配".into()));
+    // 2. 等 HelloAck——若被控端启用了密码认证（M3-5），ack 前会先发 AuthChallenge：
+    //    K = argon2id(password, salt)，proof = hex(sha256(K ‖ nonce))
+    let ack = loop {
+        match read_frame(&mut control_recv).await? {
+            Some(Message::Control(ControlMsg::AuthChallenge { salt, nonce })) => {
+                let password = password.ok_or_else(|| {
+                    SessionError::Handshake("被控端已启用密码认证，但本端未配置密码".into())
+                })?;
+                let key = derive_key(password, &salt)?;
+                let mut input = key;
+                input.extend_from_slice(&hex::decode(&nonce).map_err(|_| {
+                    SessionError::Handshake("nonce 非法 hex".into())
+                })?);
+                use sha2::Digest;
+                let proof = hex::encode(sha2::Sha256::digest(&input));
+                write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::AuthProof { proof }),
+                )
+                .await?;
             }
-            host_name
+            Some(Message::Control(ControlMsg::HelloAck { proto_version, host_name, .. })) => {
+                if proto_version != PROTOCOL_VERSION {
+                    return Err(SessionError::Handshake("host 协议版本不匹配".into()));
+                }
+                break host_name;
+            }
+            Some(Message::Control(ControlMsg::Bye { reason })) => {
+                return Err(SessionError::Handshake(format!("被 host 拒绝: {reason}")));
+            }
+            other => {
+                return Err(SessionError::Handshake(format!(
+                    "期望 HelloAck，得到 {other:?}"
+                )))
+            }
         }
-        Some(Message::Control(ControlMsg::Bye { reason })) => {
-            return Err(SessionError::Handshake(format!("被 host 拒绝: {reason}")));
-        }
-        other => return Err(SessionError::Handshake(format!("期望 HelloAck，得到 {other:?}"))),
     };
 
     // 3. Video 流（首帧 VideoStreamInfo 已随建流写入）→ Input 流（open 后立刻写首帧激活）

@@ -6,12 +6,13 @@ use rdlink_proto::{ControlMsg, Message};
 use rdlink_transport::quinn;
 use rdlink_transport::{connect, read_frame, write_frame};
 
-fn toml_conn() -> (std::net::SocketAddr, String) {
+fn toml_conn() -> (std::net::SocketAddr, String, Option<String>) {
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
     struct DefaultConn {
         host: Option<String>,
         fingerprint: Option<String>,
+        password: Option<String>,
     }
     let conn: DefaultConn = std::fs::read_to_string("rdlink.toml")
         .ok()
@@ -24,12 +25,16 @@ fn toml_conn() -> (std::net::SocketAddr, String) {
         .expect("rdlink.toml [client] host 未配置")
         .parse()
         .expect("地址格式");
-    (addr, conn.fingerprint.expect("rdlink.toml [client] fingerprint 未配置"))
+    (
+        addr,
+        conn.fingerprint.expect("rdlink.toml [client] fingerprint 未配置"),
+        conn.password,
+    )
 }
 
 async fn connected_session() -> quinn::Connection {
-    let (addr, pin) = toml_conn();
-    let session = connect(addr, &pin, "rdlink-cmd")
+    let (addr, pin, password) = toml_conn();
+    let session = connect(addr, &pin, "rdlink-cmd", password.as_deref())
         .await
         .expect("连接被控端失败");
     println!("已连接: {}（会话保持中，500ms 心跳）", session.peer_name);

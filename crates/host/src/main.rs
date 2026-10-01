@@ -7,7 +7,9 @@ mod filex;
 mod gpu;
 mod input;
 mod power;
+mod procs;
 mod serve;
+mod setpass;
 mod shellfolder;
 
 use ffmpeg_the_third as ffmpeg;
@@ -20,6 +22,22 @@ fn main() {
         Some("--encode-demo") => capture::encode_demo(),
         Some("--list-monitors") => capture::list_monitors(),
         Some("--input-demo") => input::input_demo(),
+        Some("--set-password") => {
+            let pw = args.get(2).cloned().unwrap_or_default();
+            if pw.is_empty() {
+                eprintln!("用法: host --set-password <密码>");
+                std::process::exit(2);
+            }
+            match setpass::set_password(&pw) {
+                Ok((salt, key)) => println!(
+                    "密码认证已启用（rdlink.local.toml [host]）\n  auth_salt = {salt}\n  auth_key  = {key}…\n主控端 rdlink.toml [client] 需配置相同密码；删除这两行可关闭认证"
+                ),
+                Err(e) => {
+                    eprintln!("设置失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("--set-clip") => {
             let text = args.get(2).cloned().unwrap_or_default();
             match clipboard::write_clipboard_text(&text) {

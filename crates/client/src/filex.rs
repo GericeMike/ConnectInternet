@@ -35,6 +35,13 @@ pub enum PanelEvent {
     Status(String),
     /// 进度（标签/当前/总量，字节）
     Progress { label: String, current: u64, total: u64 },
+    /// M3-4：被控端进程列表
+    ProcList(Vec<rdlink_proto::ProcEntry>),
+}
+
+/// 面板事件注入口（控制任务/其他模块向面板推送）
+pub fn send_panel_event(ev: PanelEvent) {
+    send_event(ev);
 }
 
 static REQ_TX: RwLock<Option<tokio::sync::mpsc::UnboundedSender<XferRequest>>> =

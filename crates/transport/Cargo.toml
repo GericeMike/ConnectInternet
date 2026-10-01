@@ -14,3 +14,5 @@ rustls-pki-types = "1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 sha2 = "0.10"
 hex = "0.4"
+argon2 = "0.5"
+ring = "0.17"

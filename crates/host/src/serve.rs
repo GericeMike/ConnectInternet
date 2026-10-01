@@ -27,6 +27,10 @@ pub struct HostConf {
     pub gpu_convert: Option<bool>,
     /// 文件上传落地目录（M3-2，默认 %USERPROFILE%\Downloads）
     pub download_dir: Option<String>,
+    /// M3-5 密码认证：argon2 盐 hex（[host] auth_salt）
+    pub auth_salt: Option<String>,
+    /// M3-5 密码认证：密钥 K hex（[host] auth_key，host --set-password 生成）
+    pub auth_key: Option<String>,
 }
 
 pub fn load_conf() -> HostConf {
@@ -103,7 +107,11 @@ async fn async_main() {
     let port = conf.port.unwrap_or(9527);
     let cert_dir = conf.cert_dir.unwrap_or_else(|| "certs".into());
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().expect("监听地址格式");
-    let listener = HostListener::listen(addr, Path::new(&cert_dir))
+    let auth = conf
+        .auth_salt
+        .zip(conf.auth_key)
+        .filter(|(_, k)| !k.is_empty());
+    let listener = HostListener::listen(addr, Path::new(&cert_dir), auth)
         .expect("监听失败（端口被占？删除 certs/ 可重新生成证书）");
 
     println!("rdlink-host 已就绪");
@@ -416,6 +424,36 @@ async fn serve_session_inner(
                 println!("[power] 收到电源动作: {name}，执行…");
                 if let Err(e) = crate::power::execute(action) {
                     eprintln!("[power] {name} 执行失败: {e}");
+                }
+            }
+            Ok(Some(Message::Control(ControlMsg::ProcListReq))) => {
+                // M3-4：进程列表（内部双采样阻塞 ~300ms）
+                let entries = crate::procs::list();
+                if write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::ProcListReply { entries }),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Some(Message::Control(ControlMsg::ProcKill { pid }))) => {
+                // M3-4：结束进程
+                let (ok, reason) = match crate::procs::kill(pid) {
+                    Ok(()) => (true, String::new()),
+                    Err(e) => (false, e),
+                };
+                println!("[procs] 结束进程 {pid}: {}", if ok { "成功" } else { &reason });
+                if write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::ProcKillResult { pid, ok, reason }),
+                )
+                .await
+                .is_err()
+                {
+                    break;
                 }
             }
             Ok(Some(_)) => {}

@@ -27,16 +27,16 @@ fn main() {
             render_demo::run(vsync);
         }
         Some("--host") => {
-            // 正常运行模式（T7）：client --host <ip:port> <证书指纹>
+            // 正常运行模式（T7）：client --host <ip:port> <证书指纹> [密码]
             let (addr, pin) = match (args.get(2), args.get(3)) {
                 (Some(a), Some(p)) => (a.clone(), p.clone()),
                 _ => {
-                    eprintln!("用法: client --host <ip:port> <证书指纹>（指纹看 host 启动输出）");
+                    eprintln!("用法: client --host <ip:port> <证书指纹> [密码]");
                     std::process::exit(2);
                 }
             };
             panel::spawn();
-            stream::run(&addr, &pin);
+            stream::run(&addr, &pin, args.get(4).cloned());
         }
         // M3-2 调试/运维：client --upload <本机文件>（连 rdlink.toml 默认被控端，落其 Downloads）
         Some("--upload") => {
@@ -56,6 +56,7 @@ fn main() {
             struct DefaultConn {
                 host: Option<String>,
                 fingerprint: Option<String>,
+                password: Option<String>,
             }
             let conn: DefaultConn = std::fs::read_to_string("rdlink.toml")
                 .ok()
@@ -64,7 +65,7 @@ fn main() {
                 .and_then(|c| c.try_into::<DefaultConn>().ok())
                 .unwrap_or_default();
             match (conn.host, conn.fingerprint) {
-                (Some(addr), Some(pin)) => stream::run(&addr, &pin),
+                (Some(addr), Some(pin)) => stream::run(&addr, &pin, conn.password),
                 _ => {
                     println!("rdlink-client {} (主控端)", env!("CARGO_PKG_VERSION"));
                     println!("运行模式: client --host <ip:port> <指纹>");

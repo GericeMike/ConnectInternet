@@ -85,11 +85,11 @@ fn load_conf() -> ClientConf {
         .unwrap_or_default()
 }
 
-pub fn run(addr: &str, pin: &str) {
+pub fn run(addr: &str, pin: &str, password: Option<String>) {
     let _ = CLIENT_EPOCH.set(Instant::now());
     let vsync = load_conf().vsync.unwrap_or(false);
     let event_loop = EventLoop::new().expect("事件循环创建失败");
-    let mut app = StreamApp::new(addr.to_string(), pin.to_string(), vsync);
+    let mut app = StreamApp::new(addr.to_string(), pin.to_string(), vsync, password);
     event_loop.run_app(&mut app).expect("事件循环异常退出");
     println!("client 已退出");
 }
@@ -97,6 +97,8 @@ pub fn run(addr: &str, pin: &str) {
 struct StreamApp {
     addr: String,
     pin: String,
+    /// M3-5 密码认证口令（None=被控端未启用认证时的连接方式）
+    password: Option<String>,
     window: Option<Arc<Window>>,
     display: Option<Display>,
     /// 渲染 vsync 开关（rdlink.toml [client].vsync，默认关=低延迟）
@@ -120,10 +122,11 @@ struct StreamApp {
 }
 
 impl StreamApp {
-    fn new(addr: String, pin: String, vsync: bool) -> Self {
+    fn new(addr: String, pin: String, vsync: bool, password: Option<String>) -> Self {
         Self {
             addr,
             pin,
+            password,
             window: None,
             display: None,
             display_vsync: vsync,
@@ -154,6 +157,7 @@ impl StreamApp {
     ) {
         let addr = self.addr.clone();
         let pin = self.pin.clone();
+        let password = self.password.clone();
         let slot = self.slot.clone();
         let host_size = self.host_size.clone();
         let ui = self.ui.clone();
@@ -166,7 +170,7 @@ impl StreamApp {
                     .build()
                     .expect("tokio runtime");
                 rt.block_on(stream_loop(
-                    addr, pin, slot, host_size, ui, input_tx_slot, window, shutdown_rx,
+                    addr, pin, password, slot, host_size, ui, input_tx_slot, window, shutdown_rx,
                 ));
             })
             .expect("收流线程创建失败");
@@ -195,6 +199,7 @@ enum SessionExit {
 async fn stream_loop(
     addr: String,
     pin: String,
+    password: Option<String>,
     slot: FrameSlot,
     host_size: HostSize,
     ui: Arc<UiStats>,
@@ -222,7 +227,7 @@ async fn stream_loop(
         }
         ui.conn_state.store(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let session = match connect(addr.parse().expect("地址格式: ip:port"), &pin, "rdlink-client").await {
+        let session = match connect(addr.parse().expect("地址格式: ip:port"), &pin, "rdlink-client", password.as_deref()).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("连接失败: {e}");
@@ -251,12 +256,14 @@ async fn stream_loop(
                 *input_tx_slot.lock().unwrap() = None;
                 crate::filex::clear_connection();
                 crate::panel::clear_power_tx();
+                crate::panel::clear_proc_tx();
                 return;
             }
             SessionExit::Lost => {
                 *input_tx_slot.lock().unwrap() = None;
                 crate::filex::clear_connection();
                 crate::panel::clear_power_tx();
+                crate::panel::clear_proc_tx();
                 attempt += 1; // 退避从 1s 起
             }
         }
@@ -289,6 +296,10 @@ async fn session_run(
     // M3-3：电源动作出口注入面板（面板按钮 → 通道 → ping 任务顺带发送）
     let (power_tx, mut power_rx) = mpsc::unbounded_channel::<rdlink_proto::PowerActionKind>();
     crate::panel::set_power_tx(power_tx);
+    // M3-4：进程管理请求出口（面板 → ping 任务顺带发送；应答走 control 收任务）
+    let (proc_tx, mut proc_rx) =
+        mpsc::unbounded_channel::<crate::panel::ProcRequest>();
+    crate::panel::set_proc_tx(proc_tx);
 
     // 记录 host 分辨率（输入坐标映射用）
     if let ControlMsg::VideoStreamInfo { width, height, .. } = &video_info {
@@ -345,6 +356,26 @@ async fn session_run(
                             }
                         }
                     }
+                    Message::Control(ControlMsg::ProcListReply { entries }) => {
+                        crate::filex::send_panel_event(
+                            crate::filex::PanelEvent::ProcList(entries),
+                        );
+                    }
+                    Message::Control(ControlMsg::ProcKillResult { pid, ok, reason }) => {
+                        crate::filex::send_panel_event(crate::filex::PanelEvent::Status(
+                            if ok {
+                                format!("已结束进程 {pid}")
+                            } else {
+                                format!("结束进程 {pid} 失败: {reason}")
+                            },
+                        ));
+                        // 结束后自动刷新一次列表
+                        if ok {
+                            if let Some(tx) = crate::panel::proc_tx() {
+                                let _ = tx.send(crate::panel::ProcRequest::List);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -384,6 +415,34 @@ async fn session_run(
                                 if write_frame(
                                     &mut control_send,
                                     &Message::Control(ControlMsg::PowerAction { action: a }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    // M3-4：面板进程请求
+                    req = proc_rx.recv() => {
+                        match req {
+                            Some(crate::panel::ProcRequest::List) => {
+                                if write_frame(
+                                    &mut control_send,
+                                    &Message::Control(ControlMsg::ProcListReq),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Some(crate::panel::ProcRequest::Kill(pid)) => {
+                                if write_frame(
+                                    &mut control_send,
+                                    &Message::Control(ControlMsg::ProcKill { pid }),
                                 )
                                 .await
                                 .is_err()

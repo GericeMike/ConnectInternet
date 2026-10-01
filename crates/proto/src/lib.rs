@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 /// v4: FileMsg::Request 加 to_view（M3-2 拖拽落前台 Explorer 文件夹/桌面）
 /// v5: ControlMsg 加 ClipboardImage（M3-6 截图/图片剪贴板同步，PNG 编码传输）
 /// v6: ControlMsg 加 PowerAction（M3-3 电源控制）
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7: ControlMsg 加 AuthChallenge/AuthProof（M3-5 密码认证）与
+///     ProcListReq/ProcListReply/ProcKill/ProcKillResult（M3-4 进程管理）
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -70,6 +72,19 @@ pub enum ControlMsg {
     /// （唤醒需物理按键，除非配置了唤醒源）；Shutdown/Restart 连接随之断开
     /// （Restart 后 host 随登录自启，client 自动重连）。
     PowerAction { action: PowerActionKind },
+    /// client → host（M3-5）：密码认证挑战应答。K = argon2id(password, salt)，
+    /// proof = hex(sha256(K ‖ nonce))。host 校验失败 3 次断连并冷却。
+    AuthProof { proof: String },
+    /// host → client（M3-5）：认证挑战（握手内，Hello 后、HelloAck 前）
+    AuthChallenge { salt: String, nonce: String },
+    /// client → host（M3-4）：请求被控端进程列表（CPU% 需双采样，host 内部处理）
+    ProcListReq,
+    /// host → client（M3-4）：进程列表（按 CPU 降序，含全部进程）
+    ProcListReply { entries: Vec<ProcEntry> },
+    /// client → host（M3-4）：结束指定进程
+    ProcKill { pid: u32 },
+    /// host → client（M3-4）：结束结果
+    ProcKillResult { pid: u32, ok: bool, reason: String },
 }
 
 /// FNV-1a 64 位内容指纹（M3-1 剪贴板回环抑制用）
@@ -139,6 +154,15 @@ pub enum PowerActionKind {
     Sleep,
     Shutdown,
     Restart,
+}
+
+/// M3-4：进程条目（cpu 为双采样百分比）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub name: String,
+    pub cpu: f32,
+    pub mem_mb: f64,
 }
 
 /// 一帧编码后的 H.264 数据。

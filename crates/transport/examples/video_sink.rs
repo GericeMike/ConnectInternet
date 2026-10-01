@@ -18,7 +18,8 @@ async fn main() {
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
 
     let addr = format!("{ip}:9527").parse().unwrap();
-    let mut session = connect(addr, &pin, "video-sink").await.expect("连接失败");
+    let password = std::env::var("RDLINK_PASSWORD").ok();
+    let mut session = connect(addr, &pin, "video-sink", password.as_deref()).await.expect("连接失败");
     println!("已连接 host: {}（收流 {}s）", session.peer_name, secs);
 
     let deadline = Instant::now() + Duration::from_secs(secs);

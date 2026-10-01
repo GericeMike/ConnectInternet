@@ -26,6 +26,42 @@ static LIST_HWND: AtomicUsize = AtomicUsize::new(0);
 static STATUS_HWND: AtomicUsize = AtomicUsize::new(0);
 /// host Downloads 文件列表缓存（(名称, 大小)，下载按钮按选中行取）
 static FILE_LIST: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+/// 被控端进程列表缓存（(pid, 名称)，结束按钮按选中行取）
+static PROC_LIST: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+/// 进程请求出口（stream.rs 会话建立时注入，断开时清除）
+static PROC_TX: RwLock<Option<tokio::sync::mpsc::UnboundedSender<ProcRequest>>> =
+    RwLock::new(None);
+
+/// 面板 → 会话的进程请求
+#[derive(Debug, Clone, Copy)]
+pub enum ProcRequest {
+    List,
+    Kill(u32),
+}
+
+/// stream.rs 会话建立时注入
+pub fn set_proc_tx(tx: tokio::sync::mpsc::UnboundedSender<ProcRequest>) {
+    *PROC_TX.write().unwrap() = Some(tx);
+}
+
+/// 其他模块（control 收任务自动刷新）获取请求出口
+pub fn proc_tx() -> Option<tokio::sync::mpsc::UnboundedSender<ProcRequest>> {
+    PROC_TX.read().unwrap().clone()
+}
+
+/// 会话结束清除
+pub fn clear_proc_tx() {
+    *PROC_TX.write().unwrap() = None;
+}
+
+fn submit_proc(req: ProcRequest) {
+    match PROC_TX.read().unwrap().as_ref() {
+        Some(tx) => {
+            let _ = tx.send(req);
+        }
+        None => set_status("状态：未连接，进程管理不可用"),
+    }
+}
 /// 电源动作出口（stream.rs 会话建立时注入，断开时清除）
 static POWER_TX: RwLock<Option<tokio::sync::mpsc::UnboundedSender<rdlink_proto::PowerActionKind>>> =
     RwLock::new(None);
@@ -67,6 +103,9 @@ const IDC_PWR_LOCK: i32 = 110;
 const IDC_PWR_SLEEP: i32 = 111;
 const IDC_PWR_RESTART: i32 = 112;
 const IDC_PWR_SHUTDOWN: i32 = 113;
+const IDC_PROC_LIST: i32 = 201;
+const IDC_PROC_REFRESH: i32 = 202;
+const IDC_PROC_KILL: i32 = 203;
 const TIMER_DRAIN: usize = 1;
 const CONFIRM_WINDOW_SECS: u64 = 5;
 
@@ -113,7 +152,7 @@ fn panel_thread() -> Result<(), String> {
             60,
             60,
             430,
-            360,
+            660,
             None,
             None,
             Some(hinstance.into()),
@@ -210,13 +249,54 @@ fn panel_thread() -> Result<(), String> {
             24,
             IDC_STATUS,
         )?;
+        // M3-4 进程区
+        child(
+            windows::core::w!("被控端进程（按 CPU 排序）："),
+            windows::core::w!("STATIC"),
+            CHILD,
+            16,
+            320,
+            390,
+            22,
+            0,
+        )?;
+        child(
+            windows::core::w!(""),
+            windows::core::w!("LISTBOX"),
+            CHILD | WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
+            16,
+            348,
+            398,
+            150,
+            IDC_PROC_LIST,
+        )?;
+        child(
+            windows::core::w!("刷新进程"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            16,
+            506,
+            100,
+            28,
+            IDC_PROC_REFRESH,
+        )?;
+        child(
+            windows::core::w!("结束选中进程"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            124,
+            506,
+            130,
+            28,
+            IDC_PROC_KILL,
+        )?;
         // M3-3 电源区：锁屏/睡眠立即执行；重启/关机两段式确认
         child(
             windows::core::w!("电源（重启/关机需二次确认）："),
             windows::core::w!("STATIC"),
             CHILD,
             16,
-            318,
+            544,
             390,
             22,
             0,
@@ -226,7 +306,7 @@ fn panel_thread() -> Result<(), String> {
             windows::core::w!("BUTTON"),
             CHILD,
             16,
-            344,
+            570,
             92,
             28,
             IDC_PWR_LOCK,
@@ -236,7 +316,7 @@ fn panel_thread() -> Result<(), String> {
             windows::core::w!("BUTTON"),
             CHILD,
             114,
-            344,
+            570,
             92,
             28,
             IDC_PWR_SLEEP,
@@ -246,7 +326,7 @@ fn panel_thread() -> Result<(), String> {
             windows::core::w!("BUTTON"),
             CHILD,
             212,
-            344,
+            570,
             92,
             28,
             IDC_PWR_RESTART,
@@ -256,7 +336,7 @@ fn panel_thread() -> Result<(), String> {
             windows::core::w!("BUTTON"),
             CHILD,
             310,
-            344,
+            570,
             92,
             28,
             IDC_PWR_SHUTDOWN,
@@ -409,6 +489,17 @@ unsafe extern "system" fn panel_wndproc(
                             set_status("状态：已发送关机命令");
                         });
                     }
+                    IDC_PROC_REFRESH => {
+                        submit_proc(ProcRequest::List);
+                    }
+                    IDC_PROC_KILL => {
+                        if let Some((pid, name)) = selected_process() {
+                            submit_proc(ProcRequest::Kill(pid));
+                            set_status(&format!("状态：已发送结束进程命令（{pid} {name}）"));
+                        } else {
+                            set_status("状态：请先在进程列表中选择要结束的进程");
+                        }
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -491,6 +582,34 @@ fn drain_filex_events() {
                 set_status(&format!("状态：已获取被控端 Downloads（{} 项）", entries.len()));
             }
             crate::filex::PanelEvent::Status(s) => set_status(&format!("状态：{s}")),
+            crate::filex::PanelEvent::ProcList(entries) => {
+                *PROC_LIST.lock().unwrap() =
+                    entries.iter().map(|e| (e.pid, e.name.clone())).collect();
+                unsafe {
+                    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+                    use windows::Win32::UI::WindowsAndMessaging::*;
+                    let panel = HWND(PANEL_HWND.load(Ordering::SeqCst) as _);
+                    let lb = GetDlgItem(Some(panel), IDC_PROC_LIST).unwrap_or_default();
+                    if lb.is_invalid() {
+                        return;
+                    }
+                    let _ = SendMessageW(lb, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+                    for e in entries.iter().take(60) {
+                        let text = format!(
+                            "{}\t{}\tCPU {:.1}%\t{:.0} MB",
+                            e.pid, e.name, e.cpu, e.mem_mb
+                        );
+                        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                        let _ = SendMessageW(
+                            lb,
+                            LB_ADDSTRING,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(wide.as_ptr() as _)),
+                        );
+                    }
+                }
+                set_status(&format!("状态：已获取进程列表（{} 项）", entries.len()));
+            }
             crate::filex::PanelEvent::Progress { label, current, total } => {
                 let pct = if total > 0 { current * 100 / total } else { 0 };
                 set_status(&format!(
@@ -513,6 +632,24 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// 结束进程按钮：取进程列表框选中项对应的 (pid, 名称)
+fn selected_process() -> Option<(u32, String)> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let panel = HWND(PANEL_HWND.load(Ordering::SeqCst) as _);
+        let lb = GetDlgItem(Some(panel), IDC_PROC_LIST).unwrap_or_default();
+        if lb.is_invalid() {
+            return None;
+        }
+        let sel = SendMessageW(lb, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+        if sel < 0 {
+            return None;
+        }
+        PROC_LIST.lock().unwrap().get(sel as usize).cloned()
+    }
+}
+
 /// 下载按钮：取列表框选中项对应的 (名称, 大小)
 fn selected_download() -> Option<(String, u64)> {
     let lb = LIST_HWND.load(Ordering::SeqCst);
@@ -520,9 +657,9 @@ fn selected_download() -> Option<(String, u64)> {
         return None;
     }
     unsafe {
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::*;
-        let hwnd = windows::Win32::Foundation::HWND(lb as _);
+        let hwnd = HWND(lb as _);
         let sel = SendMessageW(hwnd, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
         if sel < 0 {
             return None;
