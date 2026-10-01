@@ -257,8 +257,10 @@ impl Display {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // Outdated/Lost/Timeout 是最小化与调整尺寸期间的常态（窗口不可见时
+            // 每帧都会撞上），重配置后静默跳过本帧即可——不打日志，否则 60fps 刷屏
             status => {
-                eprintln!("surface 状态异常（{status:?}），重配置后跳过本帧");
+                let _ = status;
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
