@@ -57,6 +57,14 @@ pub fn load_conf() -> HostConf {
         if lc.gpu_convert.is_some() {
             conf.gpu_convert = lc.gpu_convert;
         }
+        if lc.download_dir.is_some() {
+            conf.download_dir = lc.download_dir;
+        }
+        // M3-5：认证配置成对生效（盐/密钥缺一不可）
+        if lc.auth_salt.is_some() && lc.auth_key.is_some() {
+            conf.auth_salt = lc.auth_salt;
+            conf.auth_key = lc.auth_key;
+        }
     }
     conf
 }
