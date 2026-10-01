@@ -283,6 +283,33 @@ async fn serve_session_inner(
         nudge_cursor();
     }
 
+    // M3-1 存量同步：会话建立即把 host 当前剪贴板推给 client——此前复制的内容
+    // 在无会话期间不会同步（监听是事件驱动），连接时补发，用户场景"被控端先复制、
+    // 主控端后连上"才能拿到内容。读失败（GameViewer 类占用）重试几次。
+    {
+        let mut text = None;
+        for _ in 0..3 {
+            if let Some(t) = crate::clipboard::read_clipboard_text() {
+                if !t.is_empty() {
+                    text = Some(t);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if let Some(text) = text {
+            if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
+                let hash = rdlink_proto::fnv1a64(text.as_bytes());
+                let _ = write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::ClipboardSync { hash, text }),
+                )
+                .await;
+                println!("[clip] 存量剪贴板已推送给新主控端");
+            }
+        }
+    }
+
     // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开 / 新主控端抢占。
     // 抢占时取消 read_frame 半读会损坏 control 帧边界——但该会话即将整体销毁，无碍。
     // 失联看门狗（M2-1c）：client 被强杀时 QUIC 要等 idle timeout(10s) 才报错，期间死会话

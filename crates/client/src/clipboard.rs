@@ -20,6 +20,19 @@ pub struct ClipboardBridge {
     pub write_tx: std::sync::mpsc::Sender<(u64, String)>,
 }
 
+/// 会话建立时调用：把 LAST_SYNCED 预置为本地当前剪贴板的指纹。
+/// 存量同步方向是 host→client（host 推它的剪贴板给新 client），
+/// client 不再首轮推送本地存量，避免两端初始互推打架。
+pub fn prime_with_local() {
+    if let Ok(mut board) = arboard::Clipboard::new() {
+        if let Ok(text) = board.get_text() {
+            if !text.is_empty() {
+                LAST_SYNCED.store(rdlink_proto::fnv1a64(text.as_bytes()), Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 pub fn spawn() -> ClipboardBridge {
     let (write_tx, write_rx) = std::sync::mpsc::channel::<(u64, String)>();
     let (changes_tx, changes_rx) = tokio::sync::watch::channel((0u64, String::new()));

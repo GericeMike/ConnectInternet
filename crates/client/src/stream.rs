@@ -205,6 +205,7 @@ async fn stream_loop(
     let mut attempt: u64 = 0;
     // M3-1 剪贴板：进程级 poll/write 双线程，会话只拿通道
     let clip = crate::clipboard::spawn();
+    crate::clipboard::prime_with_local(); // 存量方向为 host→client，抑制 client 首轮推送
     loop {
         // 重连退避：1s→2s→4s→8s→10s 封顶（首次连接不等待）
         if attempt > 0 {
@@ -295,16 +296,28 @@ async fn session_run(
     let net = Arc::new(NetStats::default());
     {
         let net = net.clone();
+        let clip_tx = clip_tx.clone();
         let mut control_recv = control_recv;
-        // 收方向：只读不 select（避免半读取消破坏帧同步）
+        // 收方向：只读不 select（避免半读取消破坏帧同步）。
+        // Pong → 对时；ClipboardSync → 交写线程落本机（其余忽略）
         tokio::spawn(async move {
             while let Ok(Some(msg)) = read_frame(&mut control_recv).await {
-                if let Message::Control(ControlMsg::Pong { t_us, host_recv_us, host_send_us }) = msg {
-                    let now = client_epoch_us();
-                    net.rtt_us.store((now - t_us).max(0) as u64, Ordering::Relaxed);
-                    net.offset_us
-                        .store(((host_recv_us + host_send_us) / 2) - ((t_us + now) / 2), Ordering::Relaxed);
-                    net.pongs.fetch_add(1, Ordering::Relaxed);
+                match msg {
+                    Message::Control(ControlMsg::Pong { t_us, host_recv_us, host_send_us }) => {
+                        let now = client_epoch_us();
+                        net.rtt_us.store((now - t_us).max(0) as u64, Ordering::Relaxed);
+                        net.offset_us.store(
+                            ((host_recv_us + host_send_us) / 2) - ((t_us + now) / 2),
+                            Ordering::Relaxed,
+                        );
+                        net.pongs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Message::Control(ControlMsg::ClipboardSync { hash, text }) => {
+                        if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
+                            let _ = clip_tx.send((hash, text));
+                        }
+                    }
+                    _ => {}
                 }
             }
         });

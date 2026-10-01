@@ -1,36 +1,38 @@
 //! M3-1：剪贴板同步（host 侧）。
 //!
 //! 结构：双 OS 线程 + 单一同步指纹（LAST_SYNCED 原子量）防回环。
-//! - listen 线程：message-only 窗口 + AddClipboardFormatListener，事件驱动收变化，
-//!   变化经 watch 通道给 serve 控制循环（同步给 client）；
+//! - poll 线程：每 500ms 读取本机剪贴板，变化经 watch 通道给 serve 控制循环；
 //! - write 线程：std mpsc 阻塞收（serve 转发来的对端剪贴板）→ SetClipboardData；
-//! - 防回环：无论"本端监听到变化"还是"收到对端写入"，都与 LAST_SYNCED 比对，
-//!   一致即忽略——本端写入引发的监听回波因此被天然抑制。
+//! - 防回环：无论"本端轮询到变化"还是"收到对端写入"，都与 LAST_SYNCED 比对，
+//!   一致即忽略——本端写入引发的回波因此被天然抑制。
 //!
-//! 剪贴板必须在使用线程内有消息泵（listener 回调经窗口消息派发），listen 窗口
-//! 建在 listen 线程；写线程无窗口（OpenClipboard(None)），各自独立无锁冲突。
+//! 为什么轮询而不是 AddClipboardFormatListener：两种窗口形态（message-only /
+//! 隐形顶层）在被控端 Win10 19045 上都收不到 WM_CLIPBOARDUPDATE 广播（本机
+//! Win11 正常，系统差异；排障记录见 docs/M3-任务拆解.md），而轮询与 client
+//! 侧完全同构、跨系统行为一致。500ms 一次 OpenClipboard 微秒级，成本可忽略；
+//! 剪贴板被占用时读取失败按本轮跳过处理。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 全进程同步指纹：最近一次"已知的剪贴板内容"（本端发出或对端写入）
 static LAST_SYNCED: AtomicU64 = AtomicU64::new(0);
 
-/// 对端文本 1 MiB 上限（防链路冲击；超限发送方丢弃）
+/// 对端文本 1 MiB 上限（防链路冲击；超限发送方直接丢弃）
 pub const MAX_CLIP_TEXT: usize = 1024 * 1024;
 
 pub struct ClipboardHub {
-    /// 本端剪贴板变化（listen 线程 → serve 控制循环），初始 (0, "")
+    /// 本端剪贴板变化（poll 线程 → serve 控制循环），初始 (0, "")
     pub changes: tokio::sync::watch::Receiver<(u64, String)>,
     /// 对端写入请求（serve 控制循环 → write 线程）
     pub write_tx: std::sync::mpsc::Sender<(u64, String)>,
 }
 
-/// 启动剪贴板双线程。监听窗口创建失败时降级：只剩写方向（打印警告，不 panic）。
+/// 启动剪贴板双线程。剪贴板不可用时降级：打印警告，方向静默失效（不 panic）。
 pub fn spawn() -> ClipboardHub {
     let (write_tx, write_rx) = std::sync::mpsc::channel::<(u64, String)>();
     let (changes_tx, changes_rx) = tokio::sync::watch::channel((0u64, String::new()));
 
-    // 写线程：对端剪贴板 → 本机
+    // 写线程：对端剪贴板 → 本机（带持久重试，见内注释）
     std::thread::Builder::new()
         .name("rdlink-clip-write".into())
         .spawn(move || {
@@ -61,105 +63,33 @@ pub fn spawn() -> ClipboardHub {
         })
         .expect("剪贴板写线程创建失败");
 
-    // 监听线程：本机 → 对端
-    let tx = changes_tx.clone();
+    // 轮询线程：本机剪贴板 → 对端
     std::thread::Builder::new()
-        .name("rdlink-clip-listen".into())
+        .name("rdlink-clip-poll".into())
         .spawn(move || {
-            if let Err(e) = listen_loop(tx) {
-                eprintln!("[clip] 剪贴板监听不可用（写方向不受影响）: {e}");
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let Some(text) = read_clipboard_text() else { continue };
+                if text.is_empty() || text.len() > MAX_CLIP_TEXT {
+                    continue;
+                }
+                let hash = rdlink_proto::fnv1a64(text.as_bytes());
+                if hash != LAST_SYNCED.load(Ordering::SeqCst) {
+                    LAST_SYNCED.store(hash, Ordering::SeqCst);
+                    println!("[clip] 本端剪贴板变化 hash={hash:016x} {} 字节", text.len());
+                    let _ = changes_tx.send((hash, text));
+                }
             }
         })
-        .expect("剪贴板监听线程创建失败");
+        .expect("剪贴板轮询线程创建失败");
 
     ClipboardHub { changes: changes_rx, write_tx }
 }
 
-// ---------- 监听线程 ----------
-
-type ChangesTx = tokio::sync::watch::Sender<(u64, String)>;
-
-fn listen_loop(tx: ChangesTx) -> Result<(), String> {
-    use windows::Win32::System::DataExchange::AddClipboardFormatListener;
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::*;
-        let class_name = windows::core::w!("rdlink_clipboard");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(clip_wndproc),
-            lpszClassName: class_name,
-            hInstance: windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .map_err(|e| e.to_string())?
-                .into(),
-            ..Default::default()
-        };
-        let atom = RegisterClassW(&wc);
-        if atom == 0 {
-            return Err("RegisterClassW 失败".into());
-        }
-        // 不可见顶层窗口（不能用 message-only：HWND_MESSAGE 窗口在 Win10 19045
-        // 上收不到 WM_CLIPBOARDUPDATE 广播，被控端实测监听全程哑火）。
-        // 不调用 ShowWindow，纯隐身。
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class_name,
-            windows::core::w!(""),
-            WINDOW_STYLE::default(),
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| format!("CreateWindowExW: {e}"))?;
-        AddClipboardFormatListener(hwnd).map_err(|e| format!("AddClipboardFormatListener: {e}"))?;
-        // watch 发送端挂到窗口上，wndproc 经 GWLP_USERDATA 取回（窗口存活期=线程存活期）
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(tx)) as _);
-        let msg = std::mem::zeroed::<MSG>();
-        let mut msg = msg;
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        Ok(())
-    }
-}
-
-// WM_CLIPBOARDUPDATE 由 windows::Win32::UI::WindowsAndMessaging 导出（wndproc 内 glob 引入）
-
-unsafe extern "system" fn clip_wndproc(
-    hwnd: windows::Win32::Foundation::HWND,
-    msg: u32,
-    _wparam: windows::Win32::Foundation::WPARAM,
-    _lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::*;
-    unsafe {
-        if msg == WM_CLIPBOARDUPDATE {
-            if let Some(text) = read_clipboard_text() {
-                let hash = rdlink_proto::fnv1a64(text.as_bytes());
-                let last = LAST_SYNCED.load(Ordering::SeqCst);
-                if hash != last && text.len() <= MAX_CLIP_TEXT {
-                    LAST_SYNCED.store(hash, Ordering::SeqCst);
-                    println!("[clip] 本端剪贴板变化 hash={hash:016x} {} 字节", text.len());
-                    // 取窗口 GWLP_USERDATA 里藏的 watch 发送端
-                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ChangesTx;
-                    if let Some(tx) = ptr.as_ref() {
-                        let _ = tx.send((hash, text));
-                    }
-                }
-            }
-            return windows::Win32::Foundation::LRESULT(0);
-        }
-        DefWindowProcW(hwnd, msg, _wparam, _lparam)
-    }
-}
-
 // ---------- 剪贴板读写原语 ----------
 
-/// 读取本机剪贴板文本（`--get-clip` 调试子命令复用）
+/// 读取本机剪贴板文本（轮询与 `--get-clip` 调试子命令复用）。
+/// 剪贴板被占用/为空/非文本 → None。
 pub fn read_clipboard_text() -> Option<String> {
     unsafe {
         use windows::Win32::Foundation::HGLOBAL;
@@ -189,14 +119,15 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
-/// 写本机剪贴板文本（`--set-clip` 调试子命令复用）
+/// 写本机剪贴板文本（write 线程与 `--set-clip` 调试子命令复用）。
+/// 内部对 OpenClipboard 做了 20×50ms 重试（剪贴板是易争抢的共享资源）。
 pub fn write_clipboard_text(text: &str) -> windows::core::Result<()> {
     unsafe {
         use windows::Win32::Foundation::{GlobalFree, HANDLE};
         use windows::Win32::System::DataExchange::*;
         use windows::Win32::System::Memory::*;
         use windows::Win32::System::Ole::CF_UNICODETEXT;
-        // 剪贴板是易争抢的共享资源（剪贴板管理器/输入法都常驻打开它），
+        // 剪贴板是易争抢的共享资源（剪贴板管理器/输入法/其他远控都常驻打开它），
         // OpenClipboard 失败重试是标准做法（Raymond Chen 背书）
         let mut opened = false;
         for _ in 0..20 {
