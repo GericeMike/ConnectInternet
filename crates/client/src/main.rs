@@ -5,6 +5,7 @@ mod decode_demo;
 mod decoder;
 mod display;
 mod input_map;
+mod panel;
 mod render_demo;
 mod stream;
 
@@ -32,6 +33,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+            panel::spawn(); // M3-0：控制面板线程（Ctrl+Alt+U 呼出）
             stream::run(&addr, &pin);
         }
         _ => {
