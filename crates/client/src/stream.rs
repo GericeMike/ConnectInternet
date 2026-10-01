@@ -270,8 +270,8 @@ async fn session_run(
     host_size: HostSize,
     ui: Arc<UiStats>,
     window: Arc<Window>,
-    mut clip_rx: tokio::sync::watch::Receiver<(u64, String)>,
-    clip_tx: std::sync::mpsc::Sender<(u64, String)>,
+    mut clip_rx: tokio::sync::watch::Receiver<Option<(u64, crate::clipboard::ClipPayload)>>,
+    clip_tx: std::sync::mpsc::Sender<crate::clipboard::ClipPayload>,
     shutdown: &mut mpsc::Receiver<()>,
 ) -> SessionExit {
     let rdlink_transport::ClientSession {
@@ -321,7 +321,22 @@ async fn session_run(
                     }
                     Message::Control(ControlMsg::ClipboardSync { hash, text }) => {
                         if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
-                            let _ = clip_tx.send((hash, text));
+                            let _ = clip_tx.send(crate::clipboard::ClipPayload::Text(text));
+                        }
+                    }
+                    Message::Control(ControlMsg::ClipboardImage { png, .. }) => {
+                        // PNG → RGBA（写线程写剪贴板；指纹由 writer 按负载重算，
+                        // 与 host 的 RGBA 指纹域一致，PNG 无损回环不出）
+                        if png.len() <= crate::clipboard::MAX_CLIP_PNG {
+                            if let Ok(rgba_img) = image::load_from_memory(&png) {
+                                let rgba_img = rgba_img.to_rgba8();
+                                let (w, h) = rgba_img.dimensions();
+                                let _ = clip_tx.send(crate::clipboard::ClipPayload::Image {
+                                    width: w,
+                                    height: h,
+                                    rgba: rgba_img.into_raw(),
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -356,18 +371,14 @@ async fn session_run(
                         .await;
                         break;
                     }
-                    // M3-1：本端剪贴板变化 → 同步给 host（空文本是初始值，跳过）
+                    // M3-1/M3-6：本端剪贴板变化（文本或图片）→ 同步给 host
                     _ = clip_rx.changed() => {
-                        let (hash, text) = clip_rx.borrow().clone();
-                        if !text.is_empty()
-                            && write_frame(
-                                &mut control_send,
-                                &Message::Control(ControlMsg::ClipboardSync { hash, text }),
-                            )
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let opt = clip_rx.borrow().clone();
+                        if let Some((hash, payload)) = opt {
+                            let msg = crate::clipboard::payload_to_msg(hash, &payload);
+                            if write_frame(&mut control_send, &msg).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -416,11 +427,27 @@ async fn session_run(
             }
         };
         let Message::VideoFrame(f) = msg else {
-            // M3-1：对端剪贴板 → 交写线程落本机（防回环由 LAST_SYNCED 统一裁决）
-            if let Message::Control(ControlMsg::ClipboardSync { hash, text }) = msg {
-                if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
-                    let _ = clip_tx.send((hash, text));
+            // M3-1/M3-6：对端剪贴板（文本或图片）→ 交写线程落本机
+            match msg {
+                Message::Control(ControlMsg::ClipboardSync { hash, text }) => {
+                    if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
+                        let _ = clip_tx.send(crate::clipboard::ClipPayload::Text(text));
+                    }
                 }
+                Message::Control(ControlMsg::ClipboardImage { png, .. }) => {
+                    if png.len() <= crate::clipboard::MAX_CLIP_PNG {
+                        if let Ok(rgba_img) = image::load_from_memory(&png) {
+                            let rgba_img = rgba_img.to_rgba8();
+                            let (w, h) = rgba_img.dimensions();
+                            let _ = clip_tx.send(crate::clipboard::ClipPayload::Image {
+                                width: w,
+                                height: h,
+                                rgba: rgba_img.into_raw(),
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         };

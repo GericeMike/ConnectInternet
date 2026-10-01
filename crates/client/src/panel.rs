@@ -122,7 +122,7 @@ fn panel_thread() -> Result<(), String> {
 
         const CHILD: WINDOW_STYLE = WINDOW_STYLE(0x4000_0000 | 0x1000_0000); // WS_CHILD|WS_VISIBLE
         child(
-            windows::core::w!("剪贴板同步：已启用（双向，纯文本）"),
+            windows::core::w!("剪贴板同步：已启用（双向：文本 + 截图）"),
             windows::core::w!("STATIC"),
             CHILD,
             16,

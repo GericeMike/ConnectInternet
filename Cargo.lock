@@ -1960,6 +1960,7 @@ name = "rdlink-host"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-the-third",
+ "image",
  "rdlink-proto",
  "rdlink-transport",
  "serde",

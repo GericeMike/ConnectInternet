@@ -68,6 +68,18 @@ fn epoch_us() -> i64 {
         .unwrap_or(0)
 }
 
+/// 剪贴板负载 → 线上消息（文本/图片）
+fn payload_to_msg(hash: u64, payload: &crate::clipboard::ClipPayload) -> Message {
+    match payload {
+        crate::clipboard::ClipPayload::Text(t) => {
+            Message::Control(ControlMsg::ClipboardSync { hash, text: t.clone() })
+        }
+        crate::clipboard::ClipPayload::Image { width, height, png, .. } => {
+            Message::Control(ControlMsg::ClipboardImage { hash, width: *width, height: *height, png: png.clone() })
+        }
+    }
+}
+
 /// 进程级编码器缓存（M2-1c）：QSV 会话建立 ~200ms,跨会话按分辨率复用。
 /// 复用编码器的新会话首帧必须 force_key() 出 IDR（新客户端没有参考链）。
 struct EncCacheEntry {
@@ -140,8 +152,8 @@ async fn async_main() {
 async fn serve_session_inner(
     session: HostSession,
     mut preempt: tokio::sync::watch::Receiver<bool>,
-    mut clip_rx: tokio::sync::watch::Receiver<(u64, String)>,
-    clip_tx: std::sync::mpsc::Sender<(u64, String)>,
+    mut clip_rx: tokio::sync::watch::Receiver<Option<(u64, crate::clipboard::ClipPayload)>>,
+    clip_tx: std::sync::mpsc::Sender<crate::clipboard::ClipPayload>,
 ) {
     let HostSession {
         peer_name,
@@ -155,6 +167,26 @@ async fn serve_session_inner(
 
     // M3-2：文件传输流服务（随连接生命周期；accept_bi 在连接关闭时自然退出）
     tokio::spawn(crate::filex::serve(connection.clone()));
+
+    // M3-1/M3-6 存量同步：会话建立即把 host 当前剪贴板（文本或图片）推给 client——
+    // 此前复制的内容在无会话期间不会同步，连接时补发。读失败（GameViewer 类
+    // 占用）重试几次。
+    {
+        let mut payload = None;
+        for _ in 0..3 {
+            if let Some(p) = crate::clipboard::read_clipboard_payload() {
+                payload = Some(p);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if let Some(p) = payload {
+            let hash = crate::clipboard::hash_payload(&p);
+            let msg = payload_to_msg(hash, &p);
+            let _ = write_frame(&mut control_send, &msg).await;
+            println!("[clip] 存量剪贴板已推送给新主控端");
+        }
+    }
 
     // 捕获线程 → channel → 发送任务。
     // 有界通道（容量 4）+ 捕获侧 try_send：发送跟不上时丢新帧保低延迟（T10 背压兜底）——
@@ -288,33 +320,6 @@ async fn serve_session_inner(
         nudge_cursor();
     }
 
-    // M3-1 存量同步：会话建立即把 host 当前剪贴板推给 client——此前复制的内容
-    // 在无会话期间不会同步（监听是事件驱动），连接时补发，用户场景"被控端先复制、
-    // 主控端后连上"才能拿到内容。读失败（GameViewer 类占用）重试几次。
-    {
-        let mut text = None;
-        for _ in 0..3 {
-            if let Some(t) = crate::clipboard::read_clipboard_text() {
-                if !t.is_empty() {
-                    text = Some(t);
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        if let Some(text) = text {
-            if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
-                let hash = rdlink_proto::fnv1a64(text.as_bytes());
-                let _ = write_frame(
-                    &mut control_send,
-                    &Message::Control(ControlMsg::ClipboardSync { hash, text }),
-                )
-                .await;
-                println!("[clip] 存量剪贴板已推送给新主控端");
-            }
-        }
-    }
-
     // Control 通道：Ping→Pong（带 host 时戳，client 用于对时）/ Bye / 断开 / 新主控端抢占。
     // 抢占时取消 read_frame 半读会损坏 control 帧边界——但该会话即将整体销毁，无碍。
     // 失联看门狗（M2-1c）：client 被强杀时 QUIC 要等 idle timeout(10s) 才报错，期间死会话
@@ -340,17 +345,14 @@ async fn serve_session_inner(
                 continue;
             }
             _ = clip_rx.changed() => {
-                // M3-1：本端剪贴板变化 → 同步给 client（空文本是初始值，跳过）
-                let (hash, text) = clip_rx.borrow().clone();
-                if !text.is_empty() {
-                    let r = write_frame(
-                        &mut control_send,
-                        &Message::Control(ControlMsg::ClipboardSync { hash, text }),
-                    )
-                    .await;
-                    if r.is_err() {
-                        break;
-                    }
+                // M3-1/M3-6：本端剪贴板变化（文本或图片）→ 同步给 client
+                let (hash, payload) = match clip_rx.borrow().clone() {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let msg = payload_to_msg(hash, &payload);
+                if write_frame(&mut control_send, &msg).await.is_err() {
+                    break;
                 }
                 continue;
             }
@@ -381,9 +383,25 @@ async fn serve_session_inner(
                 break;
             }
             Ok(Some(Message::Control(ControlMsg::ClipboardSync { hash, text }))) => {
-                // M3-1：对端剪贴板 → 交写线程落本机（防回环由 LAST_SYNCED 统一裁决）
+                // M3-1：对端文本 → 交写线程落本机（防回环由 LAST_SYNCED 统一裁决）
                 if text.len() <= crate::clipboard::MAX_CLIP_TEXT {
-                    let _ = clip_tx.send((hash, text));
+                    let _ = clip_tx.send(crate::clipboard::ClipPayload::Text(text));
+                }
+            }
+            Ok(Some(Message::Control(ControlMsg::ClipboardImage { hash, width, height, png }))) => {
+                // M3-6：对端图片 → PNG 解码后交写线程落本机
+                if png.len() <= crate::clipboard::MAX_CLIP_PNG {
+                    match crate::clipboard::decode_png(&png) {
+                        Some((w, h, rgba)) => {
+                            let _ = clip_tx.send(crate::clipboard::ClipPayload::Image {
+                                width: w,
+                                height: h,
+                                rgba,
+                                png,
+                            });
+                        }
+                        None => eprintln!("[clip] 对端图片 PNG 解码失败"),
+                    }
                 }
             }
             Ok(Some(_)) => {}

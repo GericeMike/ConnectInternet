@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// v2: VideoFrame 加 encode_us；Pong 加 host_recv_us/host_send_us（T9 打点）
 /// v3: ControlMsg 加 ClipboardSync（M3-1 剪贴板同步）
 /// v4: FileMsg::Request 加 to_view（M3-2 拖拽落前台 Explorer 文件夹/桌面）
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: ControlMsg 加 ClipboardImage（M3-6 截图/图片剪贴板同步，PNG 编码传输）
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -60,11 +61,20 @@ pub enum ControlMsg {
     /// （抑制"我写入→本端监听到变化→再同步回去"的回环）。
     /// 文本上限 1 MiB，超限发送方直接丢弃。
     ClipboardSync { hash: u64, text: String },
+    /// 双向（M3-6）：本机剪贴板**图片**变化（截图等）。
+    /// png 为 RGBA 转 PNG 的编码结果（无损回环比对：两端都以 RGBA 像素做指纹）。
+    /// 上限 8 MiB，超限发送方直接丢弃。
+    ClipboardImage { hash: u64, width: u32, height: u32, png: Vec<u8> },
 }
 
 /// FNV-1a 64 位内容指纹（M3-1 剪贴板回环抑制用）
 pub fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+    fnv1a64_with(0xcbf29ce484222325, data)
+}
+
+/// 带种子续算版本（图片指纹 = 宽、高、像素三段续算）
+pub fn fnv1a64_with(seed: u64, data: &[u8]) -> u64 {
+    let mut h = seed;
     for &b in data {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);

@@ -12,6 +12,7 @@ path = "src/main.rs"
 rdlink-proto = { path = "../proto" }
 rdlink-transport = { path = "../transport" }
 ffmpeg-the-third = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
 windows-capture = "2.0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros"] }
 toml = "0.8"
