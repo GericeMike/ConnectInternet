@@ -71,6 +71,48 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
+/// M3-2：文件传输块大小（256 KiB）
+pub const FILE_CHUNK: usize = 256 * 1024;
+
+/// M3-2：文件传输流消息（独立 bi stream，**一操作一流**，流隔离天然免掉消息 id）。
+/// 方向约定：Up=client 上传（数据 client→host，落 host Downloads）；
+///          Down=client 下载（数据 host→client，源在 host Downloads）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FileMsg {
+    /// client → host：列下载目录（M3 固定 host Downloads，path 扩展预留）
+    ListReq { path: String },
+    /// host → client：目录列表
+    ListReply { entries: Vec<FileEntry> },
+    /// client → host：发起传输
+    Request { dir: XferDir, name: String, size: u64 },
+    /// host → client：接受
+    Accept,
+    /// host → client：拒绝（路径非法/大小不符/IO）
+    Reject { reason: String },
+    /// 数据块（Up: client→host；Down: host→client）
+    Chunk { offset: u64, data: Vec<u8> },
+    /// 发送方收尾：全部内容 SHA-256（hex）
+    Done { sha256: String },
+    /// 接收方校验通过
+    Ok,
+    /// 接收方校验失败/IO 错误
+    Fail { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub mtime: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XferDir {
+    Up,
+    Down,
+}
+
 /// 一帧编码后的 H.264 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoFrame {
@@ -136,7 +178,7 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// 解码一条带长度前缀的字节帧。
-pub fn encode(msg: &Message) -> Result<Vec<u8>, EncodeError> {
+pub fn encode<T: serde::Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
     let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .expect("bincode 编码不应失败（无 IO）");
     if payload.len() > MAX_FRAME_LEN {
@@ -149,7 +191,7 @@ pub fn encode(msg: &Message) -> Result<Vec<u8>, EncodeError> {
 }
 
 /// 反序列化帧载荷（不含长度前缀）。供传输层使用。
-pub fn decode(payload: &[u8]) -> Result<Message, DecodeError> {
+pub fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, DecodeError> {
     bincode::serde::decode_from_slice(payload, bincode::config::standard())
         .map(|(msg, _)| msg)
         .map_err(|e| DecodeError::Malformed(e.to_string()))

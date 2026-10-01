@@ -206,6 +206,8 @@ async fn stream_loop(
     // M3-1 剪贴板：进程级 poll/write 双线程，会话只拿通道
     let clip = crate::clipboard::spawn();
     crate::clipboard::prime_with_local(); // 存量方向为 host→client，抑制 client 首轮推送
+    // M3-2 文件传输管理任务（进程级；连接按会话注入）
+    crate::filex::spawn_manager();
     loop {
         // 重连退避：1s→2s→4s→8s→10s 封顶（首次连接不等待）
         if attempt > 0 {
@@ -231,6 +233,8 @@ async fn stream_loop(
         println!("已连接 host: {}（握手 {:?}）", session.peer_name, t0.elapsed());
         attempt = 0;
         ui.conn_state.store(0, Ordering::Relaxed);
+        // M3-2：注入 QUIC 连接给文件传输管理任务
+        crate::filex::set_connection(session.connection.clone());
 
         // 输入通道按会话重建：换入新 Sender，旧通道随旧会话销毁
         // （断线期间积在旧通道里的事件直接作废，不重放）
@@ -245,10 +249,12 @@ async fn stream_loop(
         {
             SessionExit::User => {
                 *input_tx_slot.lock().unwrap() = None;
+                crate::filex::clear_connection();
                 return;
             }
             SessionExit::Lost => {
                 *input_tx_slot.lock().unwrap() = None;
+                crate::filex::clear_connection();
                 attempt += 1; // 退避从 1s 起
             }
         }
@@ -275,6 +281,7 @@ async fn session_run(
         control_recv,
         mut video,
         mut input,
+        connection: _,
     } = session;
 
     // 记录 host 分辨率（输入坐标映射用）
@@ -602,6 +609,15 @@ impl ApplicationHandler for StreamApp {
                     button: b,
                     down: state == ElementState::Pressed,
                 });
+            }
+
+            // M3-2：拖文件进窗口 = 上传到被控端 Downloads
+            WindowEvent::DroppedFile(path_buf) => {
+                let p = path_buf.clone();
+                println!("[file] 拖入文件: {}", p.display());
+                if !crate::filex::submit(crate::filex::XferRequest::Upload(p)) {
+                    println!("[file] 传输管理未就绪（client 初始化中）");
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

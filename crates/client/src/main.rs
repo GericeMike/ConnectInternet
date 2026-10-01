@@ -4,10 +4,12 @@ mod clipboard;
 mod decode_demo;
 mod decoder;
 mod display;
+mod filex;
 mod input_map;
 mod panel;
 mod render_demo;
 mod stream;
+mod upload_cmd;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,8 +35,18 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            panel::spawn(); // M3-0：控制面板线程（Ctrl+Alt+U 呼出）
+            panel::spawn();
             stream::run(&addr, &pin);
+        }
+        // M3-2 调试/运维：client --upload <本机文件>（连 rdlink.toml 默认被控端，落其 Downloads）
+        Some("--upload") => {
+            let path = args.get(2).cloned().ok_or("用法: client --upload <文件>").unwrap();
+            upload_cmd::run_upload(path);
+        }
+        // M3-2 调试/运维：client --download <被控端 Downloads 中的文件名>
+        Some("--download") => {
+            let name = args.get(2).cloned().ok_or("用法: client --download <文件名>").unwrap();
+            upload_cmd::run_download(name);
         }
         _ => {
             // 无参数：从 rdlink.toml [client] 读默认连接（host + fingerprint），

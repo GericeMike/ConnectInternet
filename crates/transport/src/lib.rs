@@ -12,5 +12,6 @@ pub mod cert;
 pub mod frame;
 pub mod session;
 
-pub use frame::{read_frame, write_frame, FrameError};
+pub use frame::{read_frame, read_frame_of, write_frame, write_frame_of, FrameError};
+pub use quinn;
 pub use session::{connect, ClientSession, HostListener, HostSession, SessionError};

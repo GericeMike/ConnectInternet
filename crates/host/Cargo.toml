@@ -15,6 +15,7 @@ ffmpeg-the-third = "6"
 windows-capture = "2.0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros"] }
 toml = "0.8"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",

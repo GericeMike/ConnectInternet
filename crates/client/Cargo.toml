@@ -12,6 +12,7 @@ path = "src/main.rs"
 rdlink-proto = { path = "../proto" }
 rdlink-transport = { path = "../transport" }
 arboard = "3"
+sha2 = "0.10"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",

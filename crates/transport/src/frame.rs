@@ -32,8 +32,25 @@ pub async fn write_frame(send: &mut SendStream, msg: &Message) -> Result<(), Fra
     send.write_all(&frame).await.map_err(|e| FrameError::Io(e.to_string()))
 }
 
+/// 写任意可序列化类型的帧（M3-2 文件流的 [`rdlink_proto::FileMsg`] 复用同一封装）。
+pub async fn write_frame_of<T: serde::Serialize>(
+    send: &mut SendStream,
+    msg: &T,
+) -> Result<(), FrameError> {
+    let frame = rdlink_proto::encode(msg)
+        .map_err(|e| FrameError::Io(format!("编码失败: {e:?}")))?;
+    send.write_all(&frame).await.map_err(|e| FrameError::Io(e.to_string()))
+}
+
 /// 读一帧。流被对端**在帧边界**正常关闭时返回 `Ok(None)`；中途关闭是错误。
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<Message>, FrameError> {
+    read_frame_of(recv).await
+}
+
+/// 读任意可反序列化类型的帧（与 [`write_frame_of`] 配对）。
+pub async fn read_frame_of<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+) -> Result<Option<T>, FrameError> {
     let mut head = [0u8; 4];
     match read_exact(recv, &mut head).await? {
         ReadOutcome::Filled => {}

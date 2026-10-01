@@ -3,6 +3,7 @@
 mod capture;
 mod clipboard;
 mod encoder;
+mod filex;
 mod gpu;
 mod input;
 mod serve;

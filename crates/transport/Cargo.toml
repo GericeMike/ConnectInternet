@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rdlink-proto = { path = "../proto" }
+serde = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

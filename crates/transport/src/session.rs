@@ -166,6 +166,8 @@ impl HostListener {
             control_recv,
             video,
             input,
+            /// 底层 QUIC 连接（M3-2 文件流等按需开新流的入口；内部 Arc 克隆廉价）
+            connection: conn,
         })
     }
 }
@@ -178,6 +180,8 @@ pub struct HostSession {
     pub control_recv: RecvStream,
     pub video: SendStream,
     pub input: RecvStream,
+    /// 底层 QUIC 连接（M3-2 文件流等按需开新流的入口）
+    pub connection: Connection,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +196,8 @@ pub struct ClientSession {
     pub control_recv: RecvStream,
     pub video: RecvStream,
     pub input: SendStream,
+    /// 底层 QUIC 连接（M3-2 文件流等按需开新流的入口）
+    pub connection: Connection,
 }
 
 /// 连接并完成握手。`pin` 是 host 证书的 SHA-256 指纹（hex）。
@@ -257,6 +263,8 @@ pub async fn connect(
         control_recv,
         video,
         input,
+        /// 底层 QUIC 连接（M3-2 文件流等按需开新流的入口）
+        connection: conn,
     })
 }
 

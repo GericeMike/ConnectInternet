@@ -1,4 +1,4 @@
-//! M3-0：控制面板（UI 地基）。
+//! M3-0/M3-2：控制面板。
 //!
 //! 独立原生窗口方案（而非 egui 叠层）：零新依赖、Win32 原生控件输入法开箱即用、
 //! 输入路由天然隔离（面板窗口有独立焦点，rdlink 窗口保持焦点时按键照常透传被控端，
@@ -7,21 +7,39 @@
 //! 结构：一个专用线程 = 热键 + 面板窗口 + 消息循环。
 //! - `RegisterHotKey(Ctrl+Alt+U)` 全局热键：任意焦点下呼出/隐藏面板；
 //! - 面板窗口隐藏创建，热键切换显示；点 X = 隐藏（不是销毁，控件状态保留）；
-//! - M3-2/3/4/5 的控件（文件列表/进程表/电源按钮/密码框）作为子控件挂进本窗口。
-//!
-//! 后续任务通过 `PanelCmd` 通道与面板交互（设置文本/列表等），M3-0 先立骨架。
+//! - 250ms 定时器排空文件传输事件（filex）刷新列表/进度/状态。
+//! - M3-3/4/5 的控件（电源/进程/密码框）继续作为子控件挂进本窗口。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use windows::Win32::Foundation::{HWND, LRESULT};
 
 /// 面板当前是否可见（热键线程与面板线程共享）
 static PANEL_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// 面板事件接收端（panel 线程独占）+ 控件句柄
+static EVENT_RX: Mutex<Option<std::sync::mpsc::Receiver<crate::filex::PanelEvent>>> =
+    Mutex::new(None);
+static PANEL_HWND: AtomicUsize = AtomicUsize::new(0);
+static LIST_HWND: AtomicUsize = AtomicUsize::new(0);
+static STATUS_HWND: AtomicUsize = AtomicUsize::new(0);
+/// host Downloads 文件列表缓存（(名称, 大小)，下载按钮按选中行取）
+static FILE_LIST: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
 const HOTKEY_TOGGLE: i32 = 1;
 /// Ctrl+Alt+U
 const HOTKEY_MODS: u32 = 0x0002 | 0x0001; // MOD_CONTROL | MOD_ALT
 const VK_U: u32 = 0x55;
-/// 自定义：跨线程关闭/隐藏面板（WM_APP_HIDE_PANEL）
+/// WM_APP_HIDE_PANEL
 const WM_APP_HIDE_PANEL: u32 = 0x8000;
+
+/// 子控件 ID
+const IDC_FILE_LIST: i32 = 101;
+const IDC_BTN_REFRESH: i32 = 102;
+const IDC_BTN_DOWNLOAD: i32 = 103;
+const IDC_STATUS: i32 = 104;
+const TIMER_DRAIN: usize = 1;
 
 /// 启动面板线程（热键 + 面板窗口 + 消息循环）。进程生命周期内常驻。
 pub fn spawn() {
@@ -38,14 +56,13 @@ pub fn spawn() {
 }
 
 fn panel_thread() -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::*;
     unsafe {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-        use windows::Win32::UI::WindowsAndMessaging::*;
 
         let hinstance: windows::Win32::Foundation::HINSTANCE =
             GetModuleHandleW(None).map_err(|e| e.to_string())?.into();
 
-        // 面板窗口类（普通顶层窗口，不注册显示——热键切换可见性）
         let class_name = windows::core::w!("rdlink_panel");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(panel_wndproc),
@@ -58,46 +75,126 @@ fn panel_thread() -> Result<(), String> {
             return Err("RegisterClassW 失败".into());
         }
 
+        // 隐藏创建，Ctrl+Alt+U 切换显示
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0x0000_0100), // WS_EX_TOOLWINDOW：不进任务栏
             class_name,
             windows::core::w!("rdlink 控制面板"),
-            WS_OVERLAPPEDWINDOW, // 隐藏创建，Ctrl+Alt+U 切换显示
+            WS_OVERLAPPEDWINDOW,
             60,
             60,
-            420,
-            300,
+            430,
+            360,
             None,
             None,
             Some(hinstance.into()),
             None,
         )
         .map_err(|e| format!("CreateWindowExW: {e}"))?;
+        PANEL_HWND.store(hwnd.0 as usize, Ordering::SeqCst);
 
-        // 骨架内容（M3-2/3/4/5 接入时替换为各自控件）
-        let static_style = WS_CHILD | WS_VISIBLE;
-        let mk_static = |text: windows::core::PCWSTR, y: i32, h: i32| -> Result<(), String> {
+        let child = |text: windows::core::PCWSTR,
+                     class: windows::core::PCWSTR,
+                     style: WINDOW_STYLE,
+                     x: i32,
+                     y: i32,
+                     w: i32,
+                     h: i32,
+                     id: i32|
+         -> Result<(), String> {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                windows::core::w!("STATIC"),
+                class,
                 text,
-                static_style,
-                16,
+                style,
+                x,
                 y,
-                380,
+                w,
                 h,
                 Some(hwnd),
-                None,
+                Some(HMENU(id as _)),
                 Some(hinstance.into()),
                 None,
             )
             .map(|_| ())
-            .map_err(|e| format!("STATIC: {e}"))
+            .map_err(|e| format!("{:?}: {e}", unsafe { class.to_string() }))
         };
-        mk_static(windows::core::w!("剪贴板同步：已启用（双向，纯文本）"), 20, 22)?;
-        mk_static(windows::core::w!("传输 / 进程 / 电源 / 设置：随 M3-2~M3-5 接入"), 52, 44)?;
 
-        // 全局热键：Ctrl+Alt+U 呼出/隐藏（任意焦点下生效）
+        const CHILD: WINDOW_STYLE = WINDOW_STYLE(0x4000_0000 | 0x1000_0000); // WS_CHILD|WS_VISIBLE
+        child(
+            windows::core::w!("剪贴板同步：已启用（双向，纯文本）"),
+            windows::core::w!("STATIC"),
+            CHILD,
+            16,
+            14,
+            390,
+            22,
+            0,
+        )?;
+        child(
+            windows::core::w!("被控端 Downloads（拖文件进 rdlink 窗口 = 上传）："),
+            windows::core::w!("STATIC"),
+            CHILD,
+            16,
+            46,
+            390,
+            22,
+            0,
+        )?;
+        child(
+            windows::core::w!(""),
+            windows::core::w!("LISTBOX"),
+            CHILD | WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
+            16,
+            74,
+            398,
+            170,
+            IDC_FILE_LIST,
+        )?;
+        child(
+            windows::core::w!("刷新列表"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            16,
+            252,
+            100,
+            28,
+            IDC_BTN_REFRESH,
+        )?;
+        child(
+            windows::core::w!("下载选中到主控端"),
+            windows::core::w!("BUTTON"),
+            CHILD,
+            124,
+            252,
+            160,
+            28,
+            IDC_BTN_DOWNLOAD,
+        )?;
+        child(
+            windows::core::w!("状态：-"),
+            windows::core::w!("STATIC"),
+            CHILD,
+            16,
+            288,
+            398,
+            24,
+            IDC_STATUS,
+        )?;
+        // 状态行句柄（进度/状态文本刷新用）
+        let status = GetDlgItem(Some(hwnd), IDC_STATUS).unwrap_or_default();
+        STATUS_HWND.store(status.0 as usize, Ordering::SeqCst);
+        // 列表句柄
+        let lb = GetDlgItem(Some(hwnd), IDC_FILE_LIST).unwrap_or_default();
+        LIST_HWND.store(lb.0 as usize, Ordering::SeqCst);
+
+        // 事件排水定时器
+        let (tx, rx) = std::sync::mpsc::channel::<crate::filex::PanelEvent>();
+        crate::filex::set_panel_events(tx);
+        *EVENT_RX.lock().unwrap() = Some(rx);
+        SetTimer(Some(hwnd), TIMER_DRAIN, 250, None);
+
+        // 全局热键：Ctrl+Alt+U
         use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, RegisterHotKey};
         RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, HOT_KEY_MODIFIERS(HOTKEY_MODS), VK_U)
             .map_err(|e| format!("RegisterHotKey(Ctrl+Alt+U): {e}"))?;
@@ -112,6 +209,34 @@ fn panel_thread() -> Result<(), String> {
     }
 }
 
+fn toggle_visible() {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = HWND(PANEL_HWND.load(Ordering::SeqCst) as _);
+        if hwnd.is_invalid() {
+            return;
+        }
+        if PANEL_VISIBLE.load(Ordering::SeqCst) {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            PANEL_VISIBLE.store(false, Ordering::SeqCst);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            PANEL_VISIBLE.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn set_status(text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+    let hwnd: usize = STATUS_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        unsafe {
+            let _ = SetWindowTextW(HWND(hwnd as _), windows::core::PCWSTR(wide.as_ptr()));
+        }
+    }
+}
+
 unsafe extern "system" fn panel_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
@@ -122,28 +247,147 @@ unsafe extern "system" fn panel_wndproc(
     unsafe {
         match msg {
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_TOGGLE => {
-                let visible = PANEL_VISIBLE.load(Ordering::SeqCst);
-                if visible {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    PANEL_VISIBLE.store(false, Ordering::SeqCst);
-                } else {
-                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    PANEL_VISIBLE.store(true, Ordering::SeqCst);
-                }
-                windows::Win32::Foundation::LRESULT(0)
+                toggle_visible();
+                LRESULT(0)
             }
             WM_APP_HIDE_PANEL => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                PANEL_VISIBLE.store(false, Ordering::SeqCst);
-                windows::Win32::Foundation::LRESULT(0)
+                toggle_visible_off();
+                LRESULT(0)
             }
-            // 点 X = 隐藏（控件状态保留），不销毁窗口
             WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                PANEL_VISIBLE.store(false, Ordering::SeqCst);
-                windows::Win32::Foundation::LRESULT(0)
+                toggle_visible_off();
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let id = (wparam.0 & 0xFFFF) as i32;
+                match id {
+                    IDC_BTN_REFRESH => {
+                        crate::filex::submit(crate::filex::XferRequest::Refresh);
+                    }
+                    IDC_BTN_DOWNLOAD => {
+                        if let Some((name, size)) = selected_download() {
+                            crate::filex::submit(crate::filex::XferRequest::Download { name, size });
+                        } else {
+                            set_status("状态：请先在列表中选择要下载的文件");
+                        }
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 as usize == TIMER_DRAIN => {
+                drain_filex_events();
+                LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+fn toggle_visible_off() {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = HWND(PANEL_HWND.load(Ordering::SeqCst) as _);
+        if !hwnd.is_invalid() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        PANEL_VISIBLE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// WM_TIMER：排空文件传输事件并刷新控件
+fn drain_filex_events() {
+    let mut events = Vec::new();
+    {
+        let mut rx = EVENT_RX.lock().unwrap();
+        if let Some(rx) = rx.as_ref() {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+    }
+    for ev in events {
+        match ev {
+            crate::filex::PanelEvent::List(entries) => {
+                *FILE_LIST.lock().unwrap() =
+                    entries.iter().map(|e| (e.name.clone(), e.size)).collect();
+                unsafe {
+                    use windows::Win32::Foundation::{LPARAM, WPARAM};
+                    let lb: usize = LIST_HWND.load(Ordering::SeqCst);
+                    if lb == 0 {
+                        continue;
+                    }
+                    use windows::Win32::UI::WindowsAndMessaging::*;
+                    let hwnd = windows::Win32::Foundation::HWND(lb as _);
+                    let _ = SendMessageW(hwnd, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+                    for e in &entries {
+                        let text = format!(
+                            "{}\t{}",
+                            e.name,
+                            if e.is_dir { "<目录>".into() } else { human_size(e.size) }
+                        );
+                        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                        let _ = SendMessageW(
+                            hwnd,
+                            LB_ADDSTRING,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(wide.as_ptr() as _)),
+                        );
+                    }
+                }
+                set_status(&format!("状态：已获取被控端 Downloads（{} 项）", entries.len()));
+            }
+            crate::filex::PanelEvent::Status(s) => set_status(&format!("状态：{s}")),
+            crate::filex::PanelEvent::Progress { label, current, total } => {
+                let pct = if total > 0 { current * 100 / total } else { 0 };
+                set_status(&format!(
+                    "状态：{label} — {pct}%（{} / {}）",
+                    human_size(current),
+                    human_size(total)
+                ));
+            }
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / 1048576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 下载按钮：取列表框选中项对应的 (名称, 大小)
+fn selected_download() -> Option<(String, u64)> {
+    let lb = LIST_HWND.load(Ordering::SeqCst);
+    if lb == 0 {
+        return None;
+    }
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = windows::Win32::Foundation::HWND(lb as _);
+        let sel = SendMessageW(hwnd, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+        if sel < 0 {
+            return None;
+        }
+        let len = SendMessageW(hwnd, LB_GETTEXTLEN, Some(WPARAM(sel as _)), Some(LPARAM(0))).0 as usize;
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len + 1];
+        SendMessageW(
+            hwnd,
+            LB_GETTEXT,
+            Some(WPARAM(sel as _)),
+            Some(LPARAM(buf.as_mut_ptr() as _)),
+        );
+        let _display = String::from_utf16_lossy(&buf[..len]);
+        // 按 FILE_LIST 索引取 (名称, 大小) 更可靠
+        let list = FILE_LIST.lock().unwrap();
+        list.get(sel as usize).cloned()
     }
 }

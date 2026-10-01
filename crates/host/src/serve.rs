@@ -25,6 +25,8 @@ pub struct HostConf {
     /// QSV 编码抢同一块 GPU 和共享内存带宽，导致 fps 下降——此时可关掉回退
     /// BGRA 直读 + swscale 旧路径。默认 true。
     pub gpu_convert: Option<bool>,
+    /// 文件上传落地目录（M3-2，默认 %USERPROFILE%\Downloads）
+    pub download_dir: Option<String>,
 }
 
 pub fn load_conf() -> HostConf {
@@ -147,9 +149,12 @@ async fn serve_session_inner(
         mut control_recv,
         video,
         input,
+        connection,
     } = session;
-    // 会话日志已在上层打印 peer_name；此处仅持有供未来按主控端区分策略用
     let _ = &peer_name;
+
+    // M3-2：文件传输流服务（随连接生命周期；accept_bi 在连接关闭时自然退出）
+    tokio::spawn(crate::filex::serve(connection.clone()));
 
     // 捕获线程 → channel → 发送任务。
     // 有界通道（容量 4）+ 捕获侧 try_send：发送跟不上时丢新帧保低延迟（T10 背压兜底）——
