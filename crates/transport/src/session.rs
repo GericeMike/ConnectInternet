@@ -133,7 +133,7 @@ impl HostListener {
         let (mut control_send, mut control_recv) = timeout("host-accept-bi", conn.accept_bi()).await?;
 
         let hello = match read_frame(&mut control_recv).await? {
-            Some(Message::Control(ControlMsg::Hello { proto_version, client_name })) => {
+            Some(Message::Control(ControlMsg::Hello { proto_version, client_name, is_tool })) => {
                 if proto_version != PROTOCOL_VERSION {
                     let _ = write_frame(
                         &mut control_send,
@@ -146,7 +146,7 @@ impl HostListener {
                     .await;
                     return Err(SessionError::Handshake("client 协议版本不匹配".into()));
                 }
-                (proto_version, client_name)
+                (proto_version, client_name, is_tool)
             }
             _ => return Err(SessionError::Handshake("期望 Hello".into())),
         };
@@ -217,6 +217,7 @@ impl HostListener {
 
         Ok(HostSession {
             peer_name: hello.1,
+            peer_is_tool: hello.2,
             control_send,
             control_recv,
             video,
@@ -231,6 +232,8 @@ impl HostListener {
 pub struct HostSession {
     /// 主控端自报名称
     pub peer_name: String,
+    /// CLI 工具连接（M4-T3.2）：不抢占视频会话、不占捕获
+    pub peer_is_tool: bool,
     pub control_send: SendStream,
     pub control_recv: RecvStream,
     pub video: SendStream,
@@ -274,6 +277,7 @@ pub async fn connect(
     pin: &str,
     client_name: &str,
     password: Option<&str>,
+    is_tool: bool,
 ) -> Result<ClientSession, SessionError> {
     let quic_client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
         cert::client_crypto(pin).map_err(|e| SessionError::Handshake(e.to_string()))?,
@@ -301,6 +305,7 @@ pub async fn connect(
         &Message::Control(ControlMsg::Hello {
             proto_version: PROTOCOL_VERSION,
             client_name: client_name.into(),
+            is_tool,
         }),
     )
     .await?;

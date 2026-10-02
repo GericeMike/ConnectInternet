@@ -93,9 +93,18 @@ pub enum EncoderTier {
 static NVENC_DEAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// 打开编码器:NVENC 失败落 Intel QSV 核显硬编,再失败落 x264 软编(均日志高亮)。
+/// M4-T3：bps 显式传入（档位热切=按新码率重建；open_auto 沿用基础档）。
 pub fn open_auto(width: u32, height: u32) -> Result<(Box<dyn VideoEncoder>, EncoderTier), ffmpeg::Error> {
+    open_auto_with_bitrate(width, height, bitrate())
+}
+
+pub fn open_auto_with_bitrate(
+    width: u32,
+    height: u32,
+    bps: usize,
+) -> Result<(Box<dyn VideoEncoder>, EncoderTier), ffmpeg::Error> {
     if NVENC_DEAD.get().is_none() {
-        match NvencEncoder::open(width, height) {
+        match NvencEncoder::open(width, height, bps) {
             Ok(e) => return Ok((Box::new(e), EncoderTier::Nvenc)),
             Err(err) => {
                 let _ = NVENC_DEAD.set(());
@@ -103,14 +112,14 @@ pub fn open_auto(width: u32, height: u32) -> Result<(Box<dyn VideoEncoder>, Enco
             }
         }
     }
-    match QsvEncoder::open(width, height) {
+    match QsvEncoder::open(width, height, bps) {
         Ok(e) => {
             eprintln!("✅ 已切换 h264_qsv(核显硬编,无驱动回滚需求)");
             Ok((Box::new(e), EncoderTier::Qsv))
         }
         Err(err2) => {
             eprintln!("⚠️⚠️ h264_qsv 也失败({err2})→ 最后兜底 libx264 ultrafast+zerolatency 软编,性能将显著下降 ⚠️⚠️");
-            let e = X264Encoder::open(width, height)?;
+            let e = X264Encoder::open(width, height, bps)?;
             Ok((Box::new(e), EncoderTier::X264))
         }
     }
@@ -164,13 +173,13 @@ struct NvencEncoder {
 }
 
 impl NvencEncoder {
-    fn open(width: u32, height: u32) -> Result<Self, ffmpeg::Error> {
+    fn open(width: u32, height: u32, bps: usize) -> Result<Self, ffmpeg::Error> {
         let codec = ffmpeg::encoder::find_by_name("h264_nvenc").ok_or(ffmpeg::Error::EncoderNotFound)?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec).encoder().video()?;
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::NV12); // 主路径直喂 nv12(T3a)；BGRA 回退时逐帧换 format 不可行,统一走 nv12
-        ctx.set_bit_rate(bitrate());
+        ctx.set_bit_rate(bps);
         ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒
@@ -267,13 +276,13 @@ struct QsvEncoder {
 }
 
 impl QsvEncoder {
-    fn open(width: u32, height: u32) -> Result<Self, ffmpeg::Error> {
+    fn open(width: u32, height: u32, bps: usize) -> Result<Self, ffmpeg::Error> {
         let codec = ffmpeg::encoder::find_by_name("h264_qsv").ok_or(ffmpeg::Error::EncoderNotFound)?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec).encoder().video()?;
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::NV12); // QSV 只吃 nv12,swscale 转换
-        ctx.set_bit_rate(bitrate());
+        ctx.set_bit_rate(bps);
         ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒
@@ -401,13 +410,13 @@ struct X264Encoder {
 }
 
 impl X264Encoder {
-    fn open(width: u32, height: u32) -> Result<Self, ffmpeg::Error> {
+    fn open(width: u32, height: u32, bps: usize) -> Result<Self, ffmpeg::Error> {
         let codec = ffmpeg::encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec).encoder().video()?;
         ctx.set_width(width);
         ctx.set_height(height);
         ctx.set_format(Pixel::YUV420P); // x264 不吃 bgr0,swscale 转换
-        ctx.set_bit_rate(bitrate());
+        ctx.set_bit_rate(bps);
         ctx.set_gop(gop());
         ctx.set_max_b_frames(0);
         ctx.set_time_base((1, 1_000_000)); // pts = 微秒

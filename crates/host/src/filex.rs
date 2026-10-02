@@ -28,6 +28,14 @@ pub fn downloads_dir() -> PathBuf {
     })
 }
 
+/// M4-T3.2：进行中的传输数（上传+下载）。码率档位控制器据此把视频压到
+/// 低档，避免文件流与视频流抢 QUIC 连接的拥塞窗口（"传文件视频卡"）。
+static ACTIVE_TRANSFERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn active_transfers() -> usize {
+    ACTIVE_TRANSFERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 文件流服务循环：随连接生命周期，连接断开自然退出。
 pub async fn serve(connection: quinn::Connection) {
     loop {
@@ -35,8 +43,11 @@ pub async fn serve(connection: quinn::Connection) {
             Ok(x) => x,
             Err(_) => break, // 连接关闭
         };
+        ACTIVE_TRANSFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv).await {
+            let r = handle_stream(send, recv).await;
+            ACTIVE_TRANSFERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = r {
                 println!("[file] 流处理结束: {e}");
             }
         });

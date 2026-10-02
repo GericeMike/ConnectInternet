@@ -77,6 +77,12 @@ pub fn load_conf() -> HostConf {
 /// host 进程级时钟原点：VideoFrame.pts 与 Pong 时戳共用同一时钟域（对时前提）
 static HOST_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// M4-T3：目标码率档位（bps）。控制循环按"基础档/传输压档/链路质量升降"算出
+/// 写入；捕获线程每帧比对，变化即按新码率重建编码器（≥2s 间隔防抖）。
+/// 0 = 未设置（用基础档）。
+static TIER_BPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// host epoch 起的微秒数
 fn epoch_us() -> i64 {
     HOST_EPOCH
@@ -165,17 +171,22 @@ async fn async_main() {
                 continue;
             }
         };
-        println!("主控端已连接: {}（{w}x{h}）", session.peer_name);
-        // 通知旧会话让位
-        let _ = preempt_tx.send(true);
+        println!("主控端已连接: {}（{w}x{h}）{}", session.peer_name, if session.peer_is_tool { "［工具连接］" } else { "" });
+        // 通知旧会话让位——仅 viewer 连接（M4-T3.2：CLI 工具不抢占视频会话）
+        if !session.peer_is_tool {
+            let _ = preempt_tx.send(true);
+        }
         let gate = gate.clone();
         let preempt_tx = preempt_tx.clone();
         let preempt = preempt_rx.clone();
         let clip_rx = clip.changes.clone();
         let clip_tx = clip.write_tx.clone();
+        let is_tool = session.peer_is_tool;
         tokio::spawn(async move {
-            let _permit = gate.lock().await; // 前一会话占用捕获时，本会话在此等待
-            let _ = preempt_tx.send(false); // 自己上岗后复位信号（供再下一个会话抢占）
+            if !is_tool {
+                let _permit = gate.lock().await; // 前一会话占用捕获时，本会话在此等待
+                let _ = preempt_tx.send(false); // 自己上岗后复位信号（供再下一个会话抢占）
+            }
             serve_session_inner(session, preempt, clip_rx, clip_tx).await;
             println!("会话结束，等待下一个主控端…");
         });
@@ -191,6 +202,7 @@ async fn serve_session_inner(
 ) {
     let HostSession {
         peer_name,
+        peer_is_tool: is_tool,
         mut control_send,
         mut control_recv,
         video,
@@ -201,6 +213,91 @@ async fn serve_session_inner(
 
     // M3-2：文件传输流服务（随连接生命周期；accept_bi 在连接关闭时自然退出）
     tokio::spawn(crate::filex::serve(connection.clone()));
+
+    // M4-T3.2：CLI 工具连接（--upload/--procs 等）——只走控制流+文件流，
+    // 不占捕获、不推视频、不注入输入、不推剪贴板（工具会话推剪贴板会干扰
+    // 在场 viewer 的同步语义）。
+    if is_tool {
+        println!("[session] 工具会话：仅控制流+文件流");
+        drop(video);
+        drop(input);
+        let mut last_ping = tokio::time::Instant::now();
+        loop {
+            let msg = tokio::select! {
+                m = read_frame(&mut control_recv) => m,
+                _ = preempt.changed() => {
+                    if *preempt.borrow() {
+                        // 工具会话也让位于新 viewer（不让的话会挡抢占信号复位）
+                        println!("新主控端接入，工具会话让位");
+                        break;
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep_until(last_ping + std::time::Duration::from_secs(3)) => {
+                    println!("工具会话失联（3s 无 Ping），回收");
+                    break;
+                }
+            };
+            match msg {
+                Ok(Some(Message::Control(ControlMsg::Ping { t_us }))) => {
+                    last_ping = tokio::time::Instant::now();
+                    let host_recv_us = epoch_us();
+                    let r = write_frame(
+                        &mut control_send,
+                        &Message::Control(ControlMsg::Pong {
+                            t_us,
+                            host_recv_us,
+                            host_send_us: epoch_us(),
+                        }),
+                    )
+                    .await;
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(Message::Control(ControlMsg::Bye { reason }))) => {
+                    println!("工具会话主动断开: {reason}");
+                    break;
+                }
+                Ok(Some(Message::Control(ControlMsg::ProcListReq))) => {
+                    let entries = crate::procs::list();
+                    if write_frame(
+                        &mut control_send,
+                        &Message::Control(ControlMsg::ProcListReply { entries }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Some(Message::Control(ControlMsg::ProcKill { pid }))) => {
+                    let (ok, reason) = match crate::procs::kill(pid) {
+                        Ok(()) => (true, String::new()),
+                        Err(e) => (false, e),
+                    };
+                    if write_frame(
+                        &mut control_send,
+                        &Message::Control(ControlMsg::ProcKillResult { pid, ok, reason }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    println!("工具会话 control 错误: {e}");
+                    break;
+                }
+            }
+        }
+        drop(control_send);
+        drop(control_recv);
+        return;
+    }
 
     // M3-1/M3-6 存量同步：会话建立即把 host 当前剪贴板（文本或图片）推给 client——
     // 此前复制的内容在无会话期间不会同步，连接时补发。读失败（GameViewer 类
@@ -412,6 +509,25 @@ async fn serve_session_inner(
     // 抢占时取消 read_frame 半读会损坏 control 帧边界——但该会话即将整体销毁，无碍。
     // 失联看门狗（M2-1c）：client 被强杀时 QUIC 要等 idle timeout(10s) 才报错，期间死会话
     // 僵占捕获、下一个主控端要先等它回收；client 正常每 500ms 一个 Ping，3s 无 Ping 即判失联。
+    // M4-T3：码率档位控制。档位梯 = [基础档, 30M, 15M, 8M] 截到 ≤ 基础档；
+    // 传输进行中压到 ≤15M（T3.2）；client LinkQuality（2s 一发）滞回升降档
+    // （T3.1）：p95>100ms×3 连发降一档（~6s），p95<50ms×15 连发升一档（~30s）。
+    // 结果写 TIER_BPS，捕获线程检测变化后原地重建编码器。
+    let base_bps = encoder::bitrate();
+    TIER_BPS.store(base_bps, std::sync::atomic::Ordering::Relaxed);
+    let mut ladder: Vec<usize> =
+        [50_000_000usize, 30_000_000, 15_000_000, 8_000_000]
+            .into_iter()
+            .filter(|&b| b <= base_bps)
+            .collect();
+    if ladder.is_empty() {
+        ladder.push(base_bps);
+    }
+    let mut loss_lvl = 0usize;
+    let mut bad_streak = 0u32;
+    let mut good_streak = 0u32;
+    let mut tier_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+
     let mut last_ping = tokio::time::Instant::now();
     loop {
         let msg = tokio::select! {
@@ -456,6 +572,25 @@ async fn serve_session_inner(
                         rebuild_capture(m, info, &mut capture_control, &tx, &backlog).await;
                     }
                     Err(e) => eprintln!("[monitor] 变化后目标解析失败: {e}"),
+                }
+                continue;
+            }
+            _ = tier_tick.tick() => {
+                // M4-T3：算目标档并写入（捕获线程消费）
+                let mut idx = loss_lvl.min(ladder.len() - 1);
+                let nactive = crate::filex::active_transfers();
+                if nactive > 0 {
+                    while idx + 1 < ladder.len() && ladder[idx] > 15_000_000 {
+                        idx += 1;
+                    }
+                }
+                let target = ladder[idx];
+                if TIER_BPS.load(std::sync::atomic::Ordering::Relaxed) != target {
+                    println!(
+                        "[tier] 码率档位 → {} Mbps（链路档 #{loss_lvl}，传输 {nactive} 个）",
+                        target / 1_000_000
+                    );
+                    TIER_BPS.store(target, std::sync::atomic::Ordering::Relaxed);
                 }
                 continue;
             }
@@ -584,6 +719,32 @@ async fn serve_session_inner(
                 );
                 rebuild_capture(m, ninfo, &mut capture_control, &tx, &backlog).await;
             }
+            Ok(Some(Message::Control(ControlMsg::LinkQuality { e2e_p95_us, recv_fps }))) => {
+                // M4-T3.1：链路质量反馈（滞回升降档）。只在真实收流时判定——
+                // 静止桌面 WGC 不产帧，低 fps 下的延迟分位数没有链路意义。
+                if recv_fps >= 5 {
+                    if e2e_p95_us > 100_000 {
+                        bad_streak += 1;
+                        good_streak = 0;
+                        if bad_streak >= 3 && loss_lvl + 1 < ladder.len() {
+                            loss_lvl += 1;
+                            bad_streak = 0;
+                            println!("[tier] 链路质量差（p95 {}ms）→ 降档至 #{}", e2e_p95_us / 1000, loss_lvl);
+                        }
+                    } else if e2e_p95_us < 50_000 {
+                        good_streak += 1;
+                        bad_streak = 0;
+                        if good_streak >= 15 && loss_lvl > 0 {
+                            loss_lvl -= 1;
+                            good_streak = 0;
+                            println!("[tier] 链路质量良好（p95 {}ms）→ 升档至 #{}", e2e_p95_us / 1000, loss_lvl);
+                        }
+                    } else {
+                        bad_streak = 0;
+                        good_streak = 0;
+                    }
+                }
+            }
             Ok(Some(_)) => {}
             Ok(None) => {
                 println!("control 通道关闭");
@@ -694,6 +855,10 @@ struct ServeCapture {
     /// 当前编码器尺寸（M4-T2.4：帧尺寸变化检测的基准）
     w: u32,
     h: u32,
+    /// 当前编码码率（M4-T3：与 TIER_BPS 比对，变了就重建）
+    bps: usize,
+    /// 上次码率重建时刻（M4-T3 防抖：≥2s 才允许再切）
+    last_tier_switch: Instant,
     /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// T3a：GPU VideoProcessor 转换器（首个帧纹理到达时惰性初始化；
@@ -740,11 +905,19 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             Some(e) => (e, 0, true),
             None => {
                 let t_enc = Instant::now();
-                let (e, _tier) = encoder::open_auto(w, h)?;
+                let bps = TIER_BPS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1);
+                let (e, _tier) = encoder::open_auto_with_bitrate(w, h, bps)?;
                 (SendEncoder(e), t_enc.elapsed().as_millis(), false)
             }
         };
         let enc_name = enc.0.name();
+        // M4-T3：会话启动时控制循环会写入基础档；这里 0（竞态）则退基础档
+        let init_bps = {
+            let t = TIER_BPS.load(std::sync::atomic::Ordering::Relaxed);
+            if t > 0 { t } else { encoder::bitrate() }
+        };
         println!(
             "[capture] 启动分段: WGC 激活 {activation_ms}ms | 编码器打开 {enc_open_ms}ms{}（{enc_name}）@ {w}x{h}（{}）",
             if reused { "（缓存复用）" } else { "" },
@@ -757,6 +930,8 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             tx,
             w,
             h,
+            bps: init_bps,
+            last_tier_switch: Instant::now(),
             backlog,
             gpu: None,
             gpu_dead: !load_conf().gpu_convert.unwrap_or(true),
@@ -791,7 +966,7 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                 self.w, self.h, fw, fh
             );
             let t_rebuild = Instant::now();
-            let (mut e, _tier) = encoder::open_auto(fw, fh)?;
+            let (mut e, _tier) = encoder::open_auto_with_bitrate(fw, fh, self.bps)?;
             e.force_key(); // 尺寸切换后的首帧必须 IDR（新 SPS）
             self.enc = Some(SendEncoder(e));
             self.gpu = None; // 下一帧按新尺寸惰性重建
@@ -800,6 +975,31 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             send_info(&self.tx, fw, fh);
             crate::monitors::update_active_size(fw, fh);
             println!("[capture] 重建完成 {}ms，新尺寸已下发", t_rebuild.elapsed().as_millis());
+        }
+
+        // M4-T3：码率档位热切（控制循环写 TIER_BPS）。变了就按新码率原地重建
+        // 编码器（ffmpeg 硬编打开后改 bit_rate 不生效，重建是最可靠路径；
+        // ~200ms + IDR，配合 ≥2s 防抖与档位滞回，频率很低）。
+        {
+            let want = TIER_BPS.load(std::sync::atomic::Ordering::Relaxed);
+            if want > 0 && want != self.bps && self.last_tier_switch.elapsed().as_secs() >= 2 {
+                println!(
+                    "[capture] 码率档位切换 {}→{} Mbps：原地重建编码器",
+                    self.bps / 1_000_000,
+                    want / 1_000_000,
+                );
+                let t = Instant::now();
+                match encoder::open_auto_with_bitrate(self.w, self.h, want) {
+                    Ok((mut e, _)) => {
+                        e.force_key();
+                        self.enc = Some(SendEncoder(e));
+                        self.bps = want;
+                        println!("[capture] 档位重建完成 {}ms", t.elapsed().as_millis());
+                    }
+                    Err(err) => eprintln!("⚠️ [capture] 档位重建失败({err})，维持原档"),
+                }
+                self.last_tier_switch = Instant::now();
+            }
         }
 
         {

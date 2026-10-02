@@ -38,7 +38,7 @@ async fn connected_session() -> (
     std::sync::Arc<tokio::sync::Mutex<rdlink_transport::RecvStream>>,
 ) {
     let (addr, pin, password) = toml_conn();
-    let session = connect(addr, &pin, "rdlink-cmd", password.as_deref())
+    let session = connect(addr, &pin, "rdlink-cmd", password.as_deref(), true)
         .await
         .expect("连接被控端失败");
     println!("已连接: {}（会话保持中，500ms 心跳）", session.peer_name);

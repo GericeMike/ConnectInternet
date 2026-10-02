@@ -238,7 +238,7 @@ async fn stream_loop(
         }
         ui.conn_state.store(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let session = match connect(addr.parse().expect("地址格式: ip:port"), &pin, "rdlink-client", password.as_deref()).await {
+        let session = match connect(addr.parse().expect("地址格式: ip:port"), &pin, "rdlink-client", password.as_deref(), false).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("连接失败: {e}");
@@ -532,6 +532,7 @@ async fn session_run(
     let mut enc_sum = 0u64;
     let mut dec_sum = 0u64;
     let mut sec_frames = 0u64;
+    let mut stats_seconds = 0u64; // M4-T3.1：LinkQuality 回传节拍（2s）
     let mut sec_started = Instant::now();
     let mut exit = SessionExit::Lost;
 
@@ -639,9 +640,11 @@ async fn session_run(
             window.request_redraw();
         }
 
-        // 每秒汇总 → UiStats（标题栏读）
+        // 每秒汇总 → UiStats（标题栏读）；每 2s 回传链路质量（M4-T3.1，
+        // host 据此做码率档位滞回升降）
         sec_frames += 1;
         if sec_started.elapsed() >= Duration::from_secs(1) {
+            stats_seconds += 1;
             e2e_samples.sort_unstable();
             let p = |q: usize| e2e_samples.get(e2e_samples.len() * q / 100).copied().unwrap_or(0);
             ui.fps.store(sec_frames, Ordering::Relaxed);
@@ -659,6 +662,14 @@ async fn session_run(
                 dec_sum / sec_frames.max(1) as u64 / 1000,
                 net.rtt_us.load(Ordering::Relaxed) / 1000,
             );
+            if stats_seconds % 2 == 0 {
+                if let Some(t) = CTRL_OUT.lock().unwrap().as_ref() {
+                    let _ = t.send(ControlMsg::LinkQuality {
+                        e2e_p95_us: p(95),
+                        recv_fps: sec_frames as u32,
+                    });
+                }
+            }
             e2e_samples.clear();
             enc_sum = 0;
             dec_sum = 0;

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 /// v8: ControlMsg 加 MonitorListReq/MonitorList/MonitorSelect（M4-T2 多显示器
 ///     动态切换，免重连）；VideoStreamInfo 语义扩展为可中途重发（T2.4 动态
 ///     分辨率/切屏时随视频流下发新尺寸，client 热更新解码与坐标映射）
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: ControlMsg 加 LinkQuality（M4-T3.1 client 周期回传 e2e p95/接收帧率，
+///     host 据此升降码率档位）
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -36,8 +38,10 @@ pub enum Message {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
-    /// client → host：发起连接
-    Hello { proto_version: u32, client_name: String },
+    /// client → host：发起连接。is_tool=true 为 CLI 工具连接（--upload/--procs
+    /// 等，M4-T3.2）：不抢占在场的视频会话、不占捕获（host 侧跳过视频/输入/
+    /// 剪贴板，仅控制流+文件流）。
+    Hello { proto_version: u32, client_name: String, is_tool: bool },
     /// host → client：接受连接（Control 通道）
     HelloAck {
         proto_version: u32,
@@ -95,6 +99,11 @@ pub enum ControlMsg {
     /// client → host（M4-T2）：切换被捕获显示器（会话内热切，不重连）。
     /// 越界/设备名失配时 host 回退主显示器。
     MonitorSelect { index: u32 },
+    /// client → host（M4-T3.1）：链路质量周期回传（默认 2s 一发）。
+    /// e2e_p95_us = 窗口内端到端延迟 p95（host 采集→client 收包，对时后换算），
+    /// 反映拥塞/丢包重传堆积；recv_fps = 窗口内实际收到的帧率。
+    /// host 据此做码率档位升降（滞回，见 serve.rs）。
+    LinkQuality { e2e_p95_us: u64, recv_fps: u32 },
 }
 
 /// FNV-1a 64 位内容指纹（M3-1 剪贴板回环抑制用）
@@ -332,6 +341,7 @@ mod tests {
         roundtrip(Message::Control(ControlMsg::Hello {
             proto_version: PROTOCOL_VERSION,
             client_name: "4060-laptop".into(),
+            is_tool: false,
         }));
         roundtrip(Message::Control(ControlMsg::HelloAck {
             proto_version: PROTOCOL_VERSION,
@@ -377,6 +387,7 @@ mod tests {
             }],
         }));
         roundtrip(Message::Control(ControlMsg::MonitorSelect { index: 1 }));
+        roundtrip(Message::Control(ControlMsg::LinkQuality { e2e_p95_us: 120_000, recv_fps: 58 }));
     }
 
     /// 大帧（模拟视频关键帧）+ 逐字节切割喂入
