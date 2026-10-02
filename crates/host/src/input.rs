@@ -11,11 +11,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, MOUSE_EVENT_FLAGS,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT,
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, WHEEL_DELTA,
+    GetCursorPos, WHEEL_DELTA,
 };
 
 /// 扩展键集合:注入时必须带 KEYEVENTF_EXTENDEDKEY(E0 前缀),否则对端收到的是别的键
@@ -33,14 +34,10 @@ const EXTENDED_VKS: &[u16] = &[
 
 const VK_SHIFT: u16 = 0x10;
 
-/// 屏幕像素 → MOUSEEVENTF_ABSOLUTE 的 0..=65535(M1 固定主屏,多屏 M4)
+/// 屏幕像素 → MOUSEEVENTF_ABSOLUTE 的 0..=65535（M4-T2：虚拟桌面全屏归一化，
+/// 支持捕获非主屏/负坐标副屏；ACTIVE 矩形由 monitors.rs 维护）
 fn normalize(x: u32, y: u32) -> (i32, i32) {
-    let sx = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) as f64;
-    let sy = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1) as f64;
-    (
-        ((x.min(sx as u32) as f64 / sx) * 65535.0) as i32,
-        ((y.min(sy as u32) as f64 / sy) * 65535.0) as i32,
-    )
+    crate::monitors::to_virtual_abs(x, y)
 }
 
 fn send(inputs: &[INPUT]) -> windows::core::Result<()> {
@@ -88,7 +85,7 @@ pub fn inject(event: &InputEvent) -> windows::core::Result<()> {
         InputEvent::MouseMove { x, y } => {
             let (nx, ny) = normalize(*x, *y);
             let inputs =
-                [mouse_input(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)];
+                [mouse_input(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)];
             send(&inputs)
         }
         InputEvent::MouseButton { button, down } => {
@@ -184,10 +181,21 @@ fn key_down(vk: u16) -> bool {
 /// (不打字、不点击——那些留给 T7 两机联调时在记事本里人工验收)
 pub fn input_demo() {
     println!("── T8 输入注入自测 ──");
-    let (w, h) = (
-        unsafe { GetSystemMetrics(SM_CXSCREEN) },
-        unsafe { GetSystemMetrics(SM_CYSCREEN) },
-    );
+    // 主屏尺寸（M4-T2 起经 monitors 取，保持虚拟桌面语义一致）
+    let (w, h) = {
+        let m = crate::monitors::enumerate()
+            .first()
+            .cloned()
+            .unwrap_or(rdlink_proto::MonitorInfo {
+                index: 0,
+                device_name: String::new(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            });
+        (m.width as i32, m.height as i32)
+    };
     println!("主屏: {w}x{h}");
 
     // 1) 鼠标绝对移动:注入 → 回读比对(容差 ±2px,归一化取整误差)

@@ -27,6 +27,14 @@ use crate::input_map::vk_from_key;
 
 /// client 进程时钟原点（与对时/Ping 时戳共用时钟域）
 static CLIENT_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// M4-T2：UI 线程（F10 热键）→ 流线程控制发送任务的出口。
+/// 流线程建会话时填充；会话结束不清理（下个会话覆盖，发送失败自然无害）。
+static CTRL_OUT: std::sync::Mutex<Option<mpsc::UnboundedSender<ControlMsg>>> =
+    std::sync::Mutex::new(None);
+/// F10 按下后置位；MonitorList 应答到达时消费并自动切换到下一块屏
+static MON_CYCLE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 fn client_epoch_us() -> i64 {
     CLIENT_EPOCH.get().map(|t| t.elapsed().as_micros() as i64).unwrap_or(0)
 }
@@ -303,6 +311,9 @@ async fn session_run(
     let (proc_tx, mut proc_rx) =
         mpsc::unbounded_channel::<crate::panel::ProcRequest>();
     crate::panel::set_proc_tx(proc_tx);
+    // M4-T2：通用控制出口（F10 切屏 / MonitorList 应答回调）→ 发送任务
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    *CTRL_OUT.lock().unwrap() = Some(ctrl_tx);
 
     // 记录 host 分辨率（输入坐标映射用）
     if let ControlMsg::VideoStreamInfo { width, height, .. } = &video_info {
@@ -376,6 +387,30 @@ async fn session_run(
                         if ok {
                             if let Some(tx) = crate::panel::proc_tx() {
                                 let _ = tx.send(crate::panel::ProcRequest::List);
+                            }
+                        }
+                    }
+                    Message::Control(ControlMsg::MonitorList { active, monitors }) => {
+                        // M4-T2：枚举应答。F10 触发的轮换：切到 active 的下一块屏
+                        for m in &monitors {
+                            println!(
+                                "[monitor] #{} {} {}x{} @({},{}){}",
+                                m.index,
+                                m.device_name,
+                                m.width,
+                                m.height,
+                                m.x,
+                                m.y,
+                                if m.index == active { " ← 当前" } else { "" },
+                            );
+                        }
+                        if MON_CYCLE_PENDING.swap(false, Ordering::SeqCst)
+                            && monitors.len() > 1
+                        {
+                            let next = (active + 1) % monitors.len() as u32;
+                            println!("[monitor] F10 → 切换到 #{next}（会话内热切，不重连）");
+                            if let Some(t) = CTRL_OUT.lock().unwrap().as_ref() {
+                                let _ = t.send(ControlMsg::MonitorSelect { index: next });
                             }
                         }
                     }
@@ -456,6 +491,17 @@ async fn session_run(
                             None => break,
                         }
                     }
+                    // M4-T2：UI/应答回调投递的控制消息（MonitorListReq/MonitorSelect）
+                    c = ctrl_rx.recv() => {
+                        match c {
+                            Some(msg) => {
+                                if write_frame(&mut control_send, &Message::Control(msg)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
                     // M3-1/M3-6：本端剪贴板变化（文本或图片）→ 同步给 host
                     _ = clip_rx.changed() => {
                         let opt = clip_rx.borrow().clone();
@@ -530,6 +576,15 @@ async fn session_run(
                                 rgba: rgba_img.into_raw(),
                             });
                         }
+                    }
+                }
+                // M4-T2：流尺寸信令（切屏/分辨率迁移，与帧同流保序）。
+                // host_size 更新后输入映射即刻按新尺寸换算；解码器随新 SPS 自适应。
+                Message::Control(ControlMsg::VideoStreamInfo { width, height, .. }) => {
+                    let mut g = host_size.lock().unwrap();
+                    if *g != (width, height) {
+                        println!("[video] 流尺寸切换 → {width}x{height}");
+                        *g = (width, height);
                     }
                 }
                 _ => {}
@@ -639,7 +694,7 @@ impl ApplicationHandler for StreamApp {
         window.set_ime_allowed(true);
         let mut display = Display::new(window.clone(), self.display_vsync);
 
-        println!("渲染就绪，连接 {} …（窗口模式 | F11 切全屏 | Esc 退出）", self.addr);
+        println!("渲染就绪，连接 {} …（窗口模式 | F11 全屏 | F10 切显示器 | Esc 退出）", self.addr);
 
         self.connect_started = Some(Instant::now());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -704,6 +759,16 @@ impl ApplicationHandler for StreamApp {
                                 window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                             } else {
                                 window.set_fullscreen(None);
+                            }
+                            return;
+                        }
+                        // M4-T2：轮换被控端显示器（会话内热切，不重连）。
+                        // 先发枚举请求，应答到达后由 control 收任务自动选下一块。
+                        Key::Named(NamedKey::F10) => {
+                            if let Some(t) = CTRL_OUT.lock().unwrap().as_ref() {
+                                MON_CYCLE_PENDING.store(true, Ordering::SeqCst);
+                                let _ = t.send(ControlMsg::MonitorListReq);
+                                println!("[monitor] F10：请求显示器列表…");
                             }
                             return;
                         }

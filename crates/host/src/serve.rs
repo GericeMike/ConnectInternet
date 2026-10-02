@@ -27,10 +27,12 @@ pub struct HostConf {
     pub gpu_convert: Option<bool>,
     /// 文件上传落地目录（M3-2，默认 %USERPROFILE%\Downloads）
     pub download_dir: Option<String>,
-    /// M3-5 密码认证：argon2 盐 hex（[host] auth_salt）
+    /// M3-5 密码认证：盐 hex（[host] auth_salt）
     pub auth_salt: Option<String>,
     /// M3-5 密码认证：密钥 K hex（[host] auth_key，host --set-password 生成）
     pub auth_key: Option<String>,
+    /// M4-T2：默认捕获显示器下标（0 = 主屏；会话中可用主控端 F10 热切）
+    pub monitor_index: Option<u32>,
 }
 
 pub fn load_conf() -> HostConf {
@@ -59,6 +61,9 @@ pub fn load_conf() -> HostConf {
         }
         if lc.download_dir.is_some() {
             conf.download_dir = lc.download_dir;
+        }
+        if lc.monitor_index.is_some() {
+            conf.monitor_index = lc.monitor_index;
         }
         // M3-5：认证配置成对生效（盐/密钥缺一不可）
         if lc.auth_salt.is_some() && lc.auth_key.is_some() {
@@ -99,6 +104,15 @@ struct EncCacheEntry {
     h: u32,
     enc: SendEncoder,
 }
+
+/// 捕获线程 → 发送任务的视频通道条目（M4-T2）。
+/// Frame = 编码帧；Info = 流尺寸变化（切屏/分辨率迁移），由 video_task 作为
+/// ControlMsg::VideoStreamInfo 写入视频流——与帧同流保序，client 先收 Info
+/// 再收新尺寸帧，不存在跨流竞态。
+enum VideoItem {
+    Frame(VideoFrame),
+    Info { width: u32, height: u32 },
+}
 static ENC_CACHE: std::sync::Mutex<Option<EncCacheEntry>> = std::sync::Mutex::new(None);
 
 pub fn run() {
@@ -135,9 +149,13 @@ async fn async_main() {
     let clip = crate::clipboard::spawn();
 
     loop {
-        // 每个会话重新取主显示器（分辨率可能在会话间变化）
-        let monitor = windows_capture::monitor::Monitor::primary().expect("获取主显示器失败");
-        let (w, h) = (monitor.width().expect("宽度"), monitor.height().expect("高度"));
+        // 每个会话重新解析捕获目标（分辨率/显示器拓扑可能在会话间变化）。
+        // M4-T2：默认屏由 [host] monitor_index 指定（缺省主屏）。
+        // resolve 内部已含"枚举为空回退主屏"逻辑，再失败即环境不可用。
+        let prefer = conf.monitor_index;
+        let (_monitor, _rect, mon_info) =
+            crate::monitors::resolve_capture_target(prefer).expect("捕获目标解析失败");
+        let (w, h) = (mon_info.width, mon_info.height);
         let info = ControlMsg::VideoStreamInfo { width: w, height: h, extradata: Vec::new() };
 
         let session = match listener.accept(info).await {
@@ -209,12 +227,14 @@ async fn serve_session_inner(
     // 视频流不能丢中间帧（破坏参考链），丢"整帧不入队"是流媒体标准做法；
     // gop 已缩到 90，丢帧后 ≤3s 内必有 IDR 恢复。
     let t_session = Instant::now(); // M2-1a：会话启动全程分段计时的原点
-    let (tx, mut rx) = mpsc::channel::<VideoFrame>(4);
+    let (tx, mut rx) = mpsc::channel::<VideoItem>(4);
 
     // 编码器复用（M2-1c）：从进程缓存取，命中（分辨率一致）则省 ~200ms QSV 会话建立，
     // 并强制新会话首帧出 IDR；未命中（首会话/分辨率变了）走捕获线程内现开。
-    let monitor_cur = windows_capture::monitor::Monitor::primary().expect("获取主显示器失败");
-    let (cw, ch) = (monitor_cur.width().expect("宽度"), monitor_cur.height().expect("高度"));
+    let prefer = load_conf().monitor_index;
+    let (_m, _r, mon_info) =
+        crate::monitors::resolve_capture_target(prefer).expect("捕获目标解析失败");
+    let (cw, ch) = (mon_info.width, mon_info.height);
     let mut cached_enc: Option<SendEncoder> = None;
     {
         let mut g = ENC_CACHE.lock().expect("编码器缓存锁");
@@ -228,10 +248,13 @@ async fn serve_session_inner(
         }
     }
     // free-threaded 启动：拿到 CaptureControl，会话结束后可从外部主动停止
-    // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）
+    // （关键：静止桌面时 WGC 不产帧，捕获线程自己永远发现不了通道关闭）。
+    // M4-T2：capture_control 装进 Option——会话中 MonitorSelect 热切屏时要
+    // take() 旧的 stop 掉再换新的。
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let capture_control = start_capture(tx.clone(), ready_tx, backlog.clone(), cached_enc);
+    let mut capture_control: Option<ServeCaptureControl> =
+        Some(start_capture(tx.clone(), ready_tx, backlog.clone(), cached_enc, prefer));
 
     // 发送/输入任务必须先于首帧 nudge 启动：首帧入队后要立刻有人消费，
     // 否则会在 channel 里干等 nudge 兜底的 300ms（M2-1a 插桩实测白丢 ~290ms）。
@@ -251,9 +274,9 @@ async fn serve_session_inner(
         let mut silent_probes = 0u32;
         loop {
             let frame = match tokio::time::timeout(std::time::Duration::from_secs(4), rx.recv()).await {
-                Ok(Some(frame)) => {
+                Ok(Some(item)) => {
                     silent_probes = 0;
-                    frame
+                    item
                 }
                 Ok(None) => break, // 通道关闭（会话回收路径）
                 Err(_) => {
@@ -266,6 +289,27 @@ async fn serve_session_inner(
                     }
                     continue;
                 }
+            };
+            // M4-T2：尺寸切换信令与帧同流（保序），client 先收信令再收新尺寸帧
+            let frame = match frame {
+                VideoItem::Info { width, height } => {
+                    if write_frame(
+                        &mut video,
+                        &Message::Control(ControlMsg::VideoStreamInfo {
+                            width,
+                            height,
+                            extradata: Vec::new(),
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    println!("[video] 流尺寸切换 {width}x{height} 已下发");
+                    continue;
+                }
+                VideoItem::Frame(f) => f,
             };
             let len = frame.data.len() as u64;
             match write_frame(&mut video, &Message::VideoFrame(frame.clone())).await {
@@ -464,6 +508,69 @@ async fn serve_session_inner(
                     break;
                 }
             }
+            Ok(Some(Message::Control(ControlMsg::MonitorListReq))) => {
+                // M4-T2：显示器枚举（active 按设备名对齐）
+                let monitors = crate::monitors::enumerate();
+                let active = monitors
+                    .iter()
+                    .position(|m| m.device_name == crate::monitors::active_device())
+                    .map(|i| i as u32)
+                    .unwrap_or(0);
+                if write_frame(
+                    &mut control_send,
+                    &Message::Control(ControlMsg::MonitorList { active, monitors }),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Some(Message::Control(ControlMsg::MonitorSelect { index }))) => {
+                // M4-T2：会话内热切屏——停旧捕获 → 收回编码器（尺寸匹配则复用）
+                // → 同通道起新捕获（new() 内更新 ACTIVE 并先下发新尺寸 Info）→ nudge 逼首帧。
+                // 视频流只短暂断供（百毫秒级），会话/控制流不断。
+                let (_m, _rect, ninfo) = match crate::monitors::resolve_capture_target(Some(index)) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("[monitor] 目标解析失败: {e}");
+                        continue;
+                    }
+                };
+                println!(
+                    "[monitor] 切换捕获屏 → {}（{}x{}）",
+                    ninfo.device_name, ninfo.width, ninfo.height
+                );
+                let Some(old_cc) = capture_control.take() else { continue };
+                let handler = old_cc.callback();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    tokio::task::spawn_blocking(move || old_cc.stop()),
+                )
+                .await;
+                let mut reuse: Option<SendEncoder> = None;
+                if let Some(mut h) = handler.try_lock() {
+                    if let Some(mut e) = h.enc.take() {
+                        if h.w == ninfo.width && h.h == ninfo.height {
+                            e.0.force_key();
+                            reuse = Some(e);
+                        }
+                    }
+                }
+                let (rtx, rrx) = std::sync::mpsc::channel::<()>();
+                capture_control = Some(start_capture(
+                    tx.clone(),
+                    rtx,
+                    backlog.clone(),
+                    reuse,
+                    Some(index),
+                ));
+                let _ = tokio::task::spawn_blocking(move || {
+                    rrx.recv_timeout(std::time::Duration::from_secs(3))
+                })
+                .await;
+                nudge_cursor();
+            }
             Ok(Some(_)) => {}
             Ok(None) => {
                 println!("control 通道关闭");
@@ -485,21 +592,30 @@ async fn serve_session_inner(
     drop(control_recv);
     // 回收并行化（M2-1c）：被强杀的 client 会让 input 流读挂到超时——stop/video/input
     // 三步串行最坏 900ms，并行后封顶 300ms（抢占路径上新主控端少等一半）；
-    // 编码器收回在 stop 完成后经 callback() try_lock 直取。
-    let handler = capture_control.callback();
+    // 编码器收回在 stop 完成后经 callback() try_lock 直取（尺寸取 handler 实时值
+    // ——会话中分辨率可能变过，缓存按最后实际尺寸归档才能命中）。
     let (_r_stop, r_video, r_input) = tokio::join!(
-        tokio::time::timeout(std::time::Duration::from_millis(300), async {
-            tokio::task::spawn_blocking(move || capture_control.stop()).await
-        }),
+        async {
+            if let Some(cc) = capture_control.take() {
+                let handler = cc.callback();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    tokio::task::spawn_blocking(move || cc.stop()),
+                )
+                .await;
+                if let Some(mut h) = handler.try_lock() {
+                    let (lw, lh) = (h.w, h.h);
+                    if let Some(e) = h.enc.take() {
+                        *ENC_CACHE.lock().expect("编码器缓存锁") =
+                            Some(EncCacheEntry { w: lw, h: lh, enc: e });
+                        println!("[session] 编码器已归缓存（{lw}x{lh}）");
+                    }
+                }
+            }
+        },
         tokio::time::timeout(std::time::Duration::from_millis(300), video_task),
         tokio::time::timeout(std::time::Duration::from_millis(300), input_task),
     );
-    if let Some(mut h) = handler.try_lock() {
-        if let Some(e) = h.enc.take() {
-            *ENC_CACHE.lock().expect("编码器缓存锁") = Some(EncCacheEntry { w: cw, h: ch, enc: e });
-            println!("[session] 编码器已归缓存");
-        }
-    }
     // video/input 任务尽力收统计（对端死连接的阻塞读由超时兜底）
     if let Ok(sent) = r_video {
         let (sent, bytes) = sent.unwrap_or((0, 0));
@@ -526,18 +642,44 @@ use windows_capture::settings::{
 
 /// 捕获线程启动参数（经 Settings Flags 注入）
 struct CaptureBoot {
-    tx: mpsc::Sender<VideoFrame>,
+    tx: mpsc::Sender<VideoItem>,
     ready: std::sync::mpsc::Sender<()>,
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// 启动时刻（M2-1a 分段计时）
     launch: Instant,
     /// 进程缓存命中的已打开编码器（None = 现开）
     enc: Option<SendEncoder>,
+    /// 捕获目标（M4-T2：尺寸/原点/设备名）
+    info: rdlink_proto::MonitorInfo,
+}
+
+/// 捕获控制句柄类型别名（会话中热切屏要 take/replace，装 Option 用）
+type ServeCaptureControl = windows_capture::capture::CaptureControl<
+    ServeCapture,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+/// 向视频通道可靠投递尺寸信令（有界通道满时短暂重试；会话已死则放弃）
+fn send_info(tx: &mpsc::Sender<VideoItem>, width: u32, height: u32) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match tx.try_send(VideoItem::Info { width, height }) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+    eprintln!("[capture] 尺寸信令投递超时（通道拥塞 2s）");
 }
 
 struct ServeCapture {
     enc: Option<SendEncoder>,
-    tx: mpsc::Sender<VideoFrame>,
+    tx: mpsc::Sender<VideoItem>,
+    /// 当前编码器尺寸（M4-T2.4：帧尺寸变化检测的基准）
+    w: u32,
+    h: u32,
     /// 待发队列深度（发送任务写完一帧减一；背压/T10 监控）
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// T3a：GPU VideoProcessor 转换器（首个帧纹理到达时惰性初始化；
@@ -567,12 +709,19 @@ impl GraphicsCaptureApiHandler for ServeCapture {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let CaptureBoot { tx, ready, backlog, launch, enc } = ctx.flags;
+        let CaptureBoot { tx, ready, backlog, launch, enc, info } = ctx.flags;
         // M2-1a 分段计时：start_free_threaded → new() = WGC 会话激活；
         // open_auto 内部 = NVENC 探测 + QSV/x264 打开（缓存命中时两者皆 0）
         let activation_ms = launch.elapsed().as_millis();
-        let monitor = windows_capture::monitor::Monitor::primary()?;
-        let (w, h) = (monitor.width()?, monitor.height()?);
+        let (w, h) = (info.width, info.height);
+        // M4-T2：登记当前捕获屏矩形（输入映射 MouseMove → 虚拟桌面绝对坐标）
+        crate::monitors::set_active(
+            &info.device_name,
+            crate::monitors::MonRect { x: info.x, y: info.y, w, h },
+        );
+        // M4-T2.4：捕获建立即下发尺寸信令（先于任何帧；与握手 Info 同值幂等，
+        // 切屏/分辨率迁移后为权威更新）
+        send_info(&tx, w, h);
         let (enc, enc_open_ms, reused) = match enc {
             Some(e) => (e, 0, true),
             None => {
@@ -583,14 +732,17 @@ impl GraphicsCaptureApiHandler for ServeCapture {
         };
         let enc_name = enc.0.name();
         println!(
-            "[capture] 启动分段: WGC 激活 {activation_ms}ms | 编码器打开 {enc_open_ms}ms{}（{enc_name}）@ {w}x{h}",
+            "[capture] 启动分段: WGC 激活 {activation_ms}ms | 编码器打开 {enc_open_ms}ms{}（{enc_name}）@ {w}x{h}（{}）",
             if reused { "（缓存复用）" } else { "" },
+            info.device_name,
         );
         // 通知主任务：WGC 会话已建立，可以推首帧了
         let _ = ready.send(());
         Ok(Self {
             enc: Some(enc),
             tx,
+            w,
+            h,
             backlog,
             gpu: None,
             gpu_dead: !load_conf().gpu_convert.unwrap_or(true),
@@ -614,6 +766,27 @@ impl GraphicsCaptureApiHandler for ServeCapture {
     ) -> Result<(), Self::Error> {
         let pts_us = epoch_us();
         let w = frame.width() as usize;
+
+        // M4-T2.4：动态分辨率迁移。帧尺寸变化（用户改分辨率/拔插屏）→ 原地重建
+        // 编码器 + GPU 转换器 + 下发新尺寸信令 + 修正输入映射矩形，全程不断流。
+        // 旧实现：尺寸不匹配 → 编码失败 → 捕获线程死 → 12s 看门狗回收 → 重连。
+        let (fw, fh) = (frame.width() as u32, frame.height() as u32);
+        if fw != self.w || fh != self.h {
+            println!(
+                "[capture] 分辨率变化 {}x{} → {}x{}：原地重建编码器/GPU 转换器（不断流）",
+                self.w, self.h, fw, fh
+            );
+            let t_rebuild = Instant::now();
+            let (mut e, _tier) = encoder::open_auto(fw, fh)?;
+            e.force_key(); // 尺寸切换后的首帧必须 IDR（新 SPS）
+            self.enc = Some(SendEncoder(e));
+            self.gpu = None; // 下一帧按新尺寸惰性重建
+            self.w = fw;
+            self.h = fh;
+            send_info(&self.tx, fw, fh);
+            crate::monitors::update_active_size(fw, fh);
+            println!("[capture] 重建完成 {}ms，新尺寸已下发", t_rebuild.elapsed().as_millis());
+        }
 
         {
             let Some(enc) = self.enc.as_mut() else {
@@ -696,12 +869,12 @@ impl GraphicsCaptureApiHandler for ServeCapture {
                         enc_us / 1000,
                     );
                 }
-                match self.tx.try_send(VideoFrame {
+                match self.tx.try_send(VideoItem::Frame(VideoFrame {
                     capture_pts_us: p.pts_us,
                     key: p.key,
                     encode_us: enc_us,
                     data: p.data,
-                }) {
+                })) {
                     Ok(()) => {
                         self.backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -770,15 +943,18 @@ fn nudge_cursor() {
 }
 
 /// 启动捕获（自由线程）：返回外部控制句柄，会话结束用 `stop()` 主动回收。
+/// M4-T2：prefer 指定捕获屏（resolve_capture_target 内含主屏回退）。
 fn start_capture(
-    tx: mpsc::Sender<VideoFrame>,
+    tx: mpsc::Sender<VideoItem>,
     ready: std::sync::mpsc::Sender<()>,
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     enc: Option<SendEncoder>,
-) -> windows_capture::capture::CaptureControl<ServeCapture, Box<dyn std::error::Error + Send + Sync>> {
-    let monitor = windows_capture::monitor::Monitor::primary().expect("主显示器");
+    prefer: Option<u32>,
+) -> ServeCaptureControl {
+    let (monitor, _rect, info) =
+        crate::monitors::resolve_capture_target(prefer).expect("捕获目标解析失败");
     let launch = Instant::now(); // M2-1a：捕获线程启动计时原点
-    let boot = CaptureBoot { tx, ready, backlog, launch, enc };
+    let boot = CaptureBoot { tx, ready, backlog, launch, enc, info };
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::Default,

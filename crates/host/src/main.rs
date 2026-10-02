@@ -6,6 +6,7 @@ mod encoder;
 mod filex;
 mod gpu;
 mod input;
+mod monitors;
 mod power;
 mod procs;
 mod serve;
@@ -15,6 +16,15 @@ mod shellfolder;
 use ffmpeg_the_third as ffmpeg;
 
 fn main() {
+    // M4-T2.3：Per-Monitor V2 DPI 感知。不做的话多 DPI 环境下 GetSystemMetrics
+    // （虚拟桌面/主屏尺寸，输入映射用）会被系统 DPI 虚拟化污染，坐标全错。
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.0,
+            ),
+        );
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--check") => check(),

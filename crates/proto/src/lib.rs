@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 /// v6: ControlMsg 加 PowerAction（M3-3 电源控制）
 /// v7: ControlMsg 加 AuthChallenge/AuthProof（M3-5 密码认证）与
 ///     ProcListReq/ProcListReply/ProcKill/ProcKillResult（M3-4 进程管理）
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8: ControlMsg 加 MonitorListReq/MonitorList/MonitorSelect（M4-T2 多显示器
+///     动态切换，免重连）；VideoStreamInfo 语义扩展为可中途重发（T2.4 动态
+///     分辨率/切屏时随视频流下发新尺寸，client 热更新解码与坐标映射）
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 单帧最大长度（16 MiB）：1080p60 高码率下一帧远小于此值，超限视为对端异常。
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -85,6 +88,13 @@ pub enum ControlMsg {
     ProcKill { pid: u32 },
     /// host → client（M3-4）：结束结果
     ProcKillResult { pid: u32, ok: bool, reason: String },
+    /// client → host（M4-T2）：请求显示器列表（F10 切换前先枚举）
+    MonitorListReq,
+    /// host → client（M4-T2）：显示器列表。active = 当前被捕获的显示器下标。
+    MonitorList { active: u32, monitors: Vec<MonitorInfo> },
+    /// client → host（M4-T2）：切换被捕获显示器（会话内热切，不重连）。
+    /// 越界/设备名失配时 host 回退主显示器。
+    MonitorSelect { index: u32 },
 }
 
 /// FNV-1a 64 位内容指纹（M3-1 剪贴板回环抑制用）
@@ -163,6 +173,19 @@ pub struct ProcEntry {
     pub name: String,
     pub cpu: f32,
     pub mem_mb: f64,
+}
+
+/// M4-T2：显示器条目。x/y 为虚拟桌面坐标系下的左上角原点（主屏原点恒为
+/// 0,0，副屏可为负）；width/height 为物理像素。device_name 形如
+/// `\\.\DISPLAY1`，host 侧以此与捕获设备精确匹配（枚举下标仅作展示）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub index: u32,
+    pub device_name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// 一帧编码后的 H.264 数据。
@@ -341,6 +364,19 @@ mod tests {
         roundtrip(Message::Input(InputEvent::MouseWheel { dx: 0, dy: -120 }));
         roundtrip(Message::Input(InputEvent::Key { vk: 0x25, down: false }));
         roundtrip(Message::Input(InputEvent::UnicodeChar { ch: 0x4e2d }));
+        roundtrip(Message::Control(ControlMsg::MonitorListReq));
+        roundtrip(Message::Control(ControlMsg::MonitorList {
+            active: 0,
+            monitors: vec![MonitorInfo {
+                index: 0,
+                device_name: "\\\\.\\DISPLAY1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        }));
+        roundtrip(Message::Control(ControlMsg::MonitorSelect { index: 1 }));
     }
 
     /// 大帧（模拟视频关键帧）+ 逐字节切割喂入
