@@ -10,7 +10,8 @@ use std::sync::Mutex;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    ChangeDisplaySettingsExW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
+    HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -135,6 +136,35 @@ pub fn active_device() -> String {
         .as_ref()
         .map(|(d, _)| d.clone())
         .unwrap_or_default()
+}
+
+/// `host --set-res W H`：改主显示器分辨率（M4-T2.4 E2E 驱动 / 运维工具）。
+/// 须在交互会话运行（SSH 直跑也可——本机 sshd 会话可注入输入说明窗口站可达；
+/// 若失败走 schtasks /IT）。返回 (原分辨率, CDS 结果码)。
+pub fn set_resolution(w: u32, h: u32) -> Result<((u32, u32), i32), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    };
+    unsafe {
+        let mut dm = DEVMODEW::default();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut dm).0 == 0 {
+            return Err("EnumDisplaySettingsW 失败（非交互会话？）".into());
+        }
+        let orig = (dm.dmPelsWidth, dm.dmPelsHeight);
+        dm.dmPelsWidth = w;
+        dm.dmPelsHeight = h;
+        dm.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+        let r = ChangeDisplaySettingsExW(
+            PCWSTR::null(),
+            Some(&dm as *const _),
+            None,
+            Default::default(),
+            None,
+        );
+        Ok((orig, r.0))
+    }
 }
 
 /// 解析捕获目标：优先 prefer 下标（我的枚举顺序），按 device_name 与

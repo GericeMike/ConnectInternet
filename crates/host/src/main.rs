@@ -64,6 +64,30 @@ fn main() {
             let y: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             input::click(x, y);
         }
+        Some("--set-res") => {
+            // M4-T2.4 驱动/运维：改主显示器分辨率（0 = 恢复时读不到原值的情况不会出现，
+            // 需要恢复就再调一次指定原值）
+            let w: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let h: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            if w == 0 || h == 0 {
+                eprintln!("用法: host --set-res <宽> <高>");
+                std::process::exit(2);
+            }
+            match monitors::set_resolution(w, h) {
+                Ok((orig, r)) => {
+                    if r == 0 {
+                        println!("分辨率已改: {}x{} → {w}x{h}（CDS=0）", orig.0, orig.1);
+                    } else {
+                        println!("ChangeDisplaySettingsEx 结果码 {r}（0=成功，-2=模式不支持，-5=参数错误）");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => serve::run(), // 正常运行模式（T7 视频 + T8 输入注入待接）
     }
 }
