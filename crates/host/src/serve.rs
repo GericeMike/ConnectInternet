@@ -323,6 +323,10 @@ async fn serve_session_inner(
     // 有界通道（容量 4）+ 捕获侧 try_send：发送跟不上时丢新帧保低延迟（T10 背压兜底）——
     // 视频流不能丢中间帧（破坏参考链），丢"整帧不入队"是流媒体标准做法；
     // gop 已缩到 90，丢帧后 ≤3s 内必有 IDR 恢复。
+    // M4-T3：基础档必须在 start_capture 之前写入 TIER_BPS——捕获线程 new() 会
+    // 现开编码器，读到 0 再被 .max(1) 类兜底污染就是 1bps 惨案（QSV/x264 全崩）。
+    let base_bps = encoder::bitrate();
+    TIER_BPS.store(base_bps, std::sync::atomic::Ordering::Relaxed);
     let t_session = Instant::now(); // M2-1a：会话启动全程分段计时的原点
     let (tx, mut rx) = mpsc::channel::<VideoItem>(4);
 
@@ -513,8 +517,7 @@ async fn serve_session_inner(
     // 传输进行中压到 ≤15M（T3.2）；client LinkQuality（2s 一发）滞回升降档
     // （T3.1）：p95>100ms×3 连发降一档（~6s），p95<50ms×15 连发升一档（~30s）。
     // 结果写 TIER_BPS，捕获线程检测变化后原地重建编码器。
-    let base_bps = encoder::bitrate();
-    TIER_BPS.store(base_bps, std::sync::atomic::Ordering::Relaxed);
+    // （base_bps 与初始 store 已在 start_capture 前完成，见上。）
     let mut ladder: Vec<usize> =
         [50_000_000usize, 30_000_000, 15_000_000, 8_000_000]
             .into_iter()
@@ -905,9 +908,11 @@ impl GraphicsCaptureApiHandler for ServeCapture {
             Some(e) => (e, 0, true),
             None => {
                 let t_enc = Instant::now();
-                let bps = TIER_BPS
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(1);
+                // 会话侧在 start_capture 前已写入基础档；防御竞态：0 则退基础档
+                let bps = {
+                    let t = TIER_BPS.load(std::sync::atomic::Ordering::Relaxed);
+                    if t > 0 { t } else { encoder::bitrate() }
+                };
                 let (e, _tier) = encoder::open_auto_with_bitrate(w, h, bps)?;
                 (SendEncoder(e), t_enc.elapsed().as_millis(), false)
             }
