@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -110,6 +110,8 @@ struct StreamApp {
     /// 退出信号（主线程 → 收流线程：先把 Bye 真正发完再退出）
     shutdown_tx: Option<mpsc::Sender<()>>,
     fullscreen: bool,
+    /// IME 组字窗口活跃（M4-T1）：期间抑制物理键转发，Commit 后逐字注入
+    ime_active: bool,
     // 渲染统计
     rendered: u64,
     last_title: Instant,
@@ -135,6 +137,7 @@ impl StreamApp {
             input_tx_slot: Arc::new(Mutex::new(None)),
             shutdown_tx: None,
             fullscreen: false,
+            ime_active: false,
             rendered: 0,
             last_title: Instant::now(),
             title_frames: 0,
@@ -660,6 +663,28 @@ impl ApplicationHandler for StreamApp {
             }
 
             // ---------- T8 输入捕获（本地热键先拦截，其余转发 host） ----------
+            // M4-T1：IME 提交文本 → 逐字符 UnicodeChar（host KEYEVENTF_UNICODE 注入）。
+            // 用户用本机输入法打中文/emoji 时，Commit 携带最终文本；此时对应的
+            // 物理键事件仍会照常转发（远端是英文键盘态，组合出的字母会被远端
+            // 应用忽略或与注入文本重复——实测以注入文本为准，重复字符由
+            // Ime 期间抑制物理键转发来避免，见 Enabled/Preedit 分支的抑制窗口）。
+            WindowEvent::Ime(ime_event) => match ime_event {
+                Ime::Enabled => {
+                    self.ime_active = true;
+                }
+                Ime::Preedit(_, _) => {
+                    self.ime_active = true; // 候选窗口期间不转发物理键（防误击远端）
+                }
+                Ime::Commit(text) => {
+                    for ch in text.chars() {
+                        self.forward_input(InputEvent::UnicodeChar { ch: ch as u32 });
+                    }
+                }
+                Ime::Disabled => {
+                    self.ime_active = false;
+                }
+            },
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // 本地热键
                 if event.state == ElementState::Pressed {
@@ -679,6 +704,10 @@ impl ApplicationHandler for StreamApp {
                         }
                         _ => {}
                     }
+                }
+                // IME 组字期间不转发物理键（字母会打到远端造成重复/乱序）
+                if self.ime_active {
+                    return;
                 }
                 // 转发（物理键 → VK）
                 if let Some(vk) = vk_from_key(event.physical_key) {

@@ -135,12 +135,20 @@ pub fn inject(event: &InputEvent) -> windows::core::Result<()> {
             send(&inputs)
         }
         InputEvent::UnicodeChar { ch } => {
-            // KEYEVENTF_UNICODE 必须成对(down+up),wVk=0,字符放 wScan
-            let ch = (*ch & 0xFFFF) as u16;
-            let inputs = [
-                key_input(0, ch, KEYEVENTF_UNICODE),
-                key_input(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
-            ];
+            // KEYEVENTF_UNICODE 必须成对(down+up),wVk=0,字符放 wScan。
+            // BMP 外字符（emoji 等，U+10000+）拆 UTF-16 代理对逐个注入。
+            let cp = *ch & 0x1F_FFFF;
+            let units: Vec<u16> = if cp < 0x1_0000 {
+                vec![cp as u16]
+            } else {
+                let c = cp - 0x1_0000;
+                vec![0xD800 | (c >> 10) as u16, 0xDC00 | (c & 0x3FF) as u16]
+            };
+            let mut inputs = Vec::with_capacity(units.len() * 2);
+            for u in units {
+                inputs.push(key_input(0, u, KEYEVENTF_UNICODE));
+                inputs.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+            }
             send(&inputs)
         }
     }
