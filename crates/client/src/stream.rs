@@ -634,6 +634,9 @@ impl ApplicationHandler for StreamApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("窗口创建失败"));
+        // M4-T1：winit 0.30 Windows 端默认摘除窗口 IME 上下文（Ime 事件不会来），
+        // 必须显式开启，本机输入法组字才会走 WindowEvent::Ime。
+        window.set_ime_allowed(true);
         let mut display = Display::new(window.clone(), self.display_vsync);
 
         println!("渲染就绪，连接 {} …（窗口模式 | F11 切全屏 | Esc 退出）", self.addr);
@@ -667,18 +670,20 @@ impl ApplicationHandler for StreamApp {
             // 用户用本机输入法打中文/emoji 时，Commit 携带最终文本；此时对应的
             // 物理键事件仍会照常转发（远端是英文键盘态，组合出的字母会被远端
             // 应用忽略或与注入文本重复——实测以注入文本为准，重复字符由
-            // Ime 期间抑制物理键转发来避免，见 Enabled/Preedit 分支的抑制窗口）。
+            // 组字期间（非空 Preedit）抑制物理键转发来避免，见下方 Ime 分支）。
             WindowEvent::Ime(ime_event) => match ime_event {
-                Ime::Enabled => {
-                    self.ime_active = true;
-                }
-                Ime::Preedit(_, _) => {
-                    self.ime_active = true; // 候选窗口期间不转发物理键（防误击远端）
+                // 抑制窗口 = "组字进行中"，而非 "IME 开启"。IME 开启但空闲
+                // （英文模式/两次组字之间）时 Enter/Backspace/方向键等物理键
+                // 必须照常转发，否则输入法一开这些键就全被吞了。
+                Ime::Enabled => {}
+                Ime::Preedit(text, _) => {
+                    self.ime_active = !text.is_empty(); // 空串=组字已清空
                 }
                 Ime::Commit(text) => {
                     for ch in text.chars() {
                         self.forward_input(InputEvent::UnicodeChar { ch: ch as u32 });
                     }
+                    self.ime_active = false; // 组字结束，恢复物理键转发
                 }
                 Ime::Disabled => {
                     self.ime_active = false;
