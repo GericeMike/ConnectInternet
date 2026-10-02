@@ -185,16 +185,7 @@ pub fn resolve_capture_target(
         .or_else(|| mine.first())
         .cloned();
     match pick {
-        Some(p) => {
-            let wc = windows_capture::monitor::Monitor::enumerate()?;
-            let m = wc
-                .iter()
-                .find(|m| m.device_name().ok().as_deref() == Some(p.device_name.as_str()))
-                .or_else(|| wc.get(p.index as usize))
-                .ok_or("windows-capture 枚举中找不到目标显示器")?;
-            let rect = MonRect { x: p.x, y: p.y, w: p.width, h: p.height };
-            Ok((m.clone(), rect, p))
-        }
+        Some(p) => resolve_capture_device(&p.device_name),
         None => {
             // 一块屏都枚举不到（异常环境）——回退 windows-capture 主屏
             let m = windows_capture::monitor::Monitor::primary()?;
@@ -209,5 +200,44 @@ pub fn resolve_capture_target(
             };
             Ok((m, MonRect { x: 0, y: 0, w, h }, info))
         }
+    }
+}
+
+/// 按设备名解析捕获目标（分辨率变化重建时用——拓扑变了下标会漂移，名字才稳）
+pub fn resolve_capture_device(
+    device: &str,
+) -> Result<
+    (
+        windows_capture::monitor::Monitor,
+        MonRect,
+        rdlink_proto::MonitorInfo,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    if device.is_empty() {
+        return Err("设备名为空".into());
+    }
+    let p = enumerate()
+        .into_iter()
+        .find(|m| m.device_name == device)
+        .ok_or("设备已不在线")?;
+    let wc = windows_capture::monitor::Monitor::enumerate()?;
+    let m = wc
+        .iter()
+        .find(|m| m.device_name().ok().as_deref() == Some(p.device_name.as_str()))
+        .or_else(|| wc.get(p.index as usize))
+        .ok_or("windows-capture 枚举中找不到目标显示器")?;
+    let rect = MonRect { x: p.x, y: p.y, w: p.width, h: p.height };
+    Ok((m.clone(), rect, p))
+}
+
+/// 活动显示器的当前矩形 vs 捕获登记矩形是否发生变化（M4-T2.4 监视器用；
+/// WGC 帧池不随显示模式缩放——分辨率变了不重建就会一直发旧尺寸的缩放画面）
+pub fn active_size_changed() -> bool {
+    let cur = ACTIVE.lock().expect("ACTIVE 锁").clone();
+    let Some((dev, r)) = cur else { return false };
+    match enumerate().into_iter().find(|m| m.device_name == dev) {
+        Some(m) => m.width != r.w || m.height != r.h || m.x != r.x || m.y != r.y,
+        None => false, // 设备拔掉：先不动，WGC 会话结束/看门狗兜底
     }
 }

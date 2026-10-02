@@ -253,8 +253,36 @@ async fn serve_session_inner(
     // take() 旧的 stop 掉再换新的。
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut capture_control: Option<ServeCaptureControl> =
-        Some(start_capture(tx.clone(), ready_tx, backlog.clone(), cached_enc, prefer));
+    let (init_monitor, _init_rect, init_info) =
+        crate::monitors::resolve_capture_target(prefer).expect("捕获目标解析失败");
+    let mut capture_control: Option<ServeCaptureControl> = Some(start_capture(
+        tx.clone(),
+        ready_tx,
+        backlog.clone(),
+        cached_enc,
+        init_monitor,
+        init_info,
+    ));
+
+    // M4-T2.4：分辨率/拓扑监视。WGC 帧池不随显示模式缩放——用户改分辨率后
+    // 若不重建，画面会一直以旧尺寸缩放发送（糊且坐标映射错）。2s 比对活动
+    // 显示器矩形，变了通知控制循环会话内重建（与切屏同路径）。
+    let (res_tx, mut res_rx) = mpsc::channel::<()>(1);
+    let (resmon_stop_tx, mut resmon_stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if crate::monitors::active_size_changed() {
+                        let _ = res_tx.try_send(());
+                    }
+                }
+                _ = resmon_stop_rx.changed() => break,
+            }
+        }
+    });
 
     // 发送/输入任务必须先于首帧 nudge 启动：首帧入队后要立刻有人消费，
     // 否则会在 channel 里干等 nudge 兜底的 300ms（M2-1a 插桩实测白丢 ~290ms）。
@@ -416,6 +444,21 @@ async fn serve_session_inner(
                 }
                 continue;
             }
+            _ = res_rx.recv() => {
+                // M4-T2.4：分辨率/拓扑变化 → 按设备名重解析并会话内重建捕获
+                match crate::monitors::resolve_capture_device(&crate::monitors::active_device())
+                {
+                    Ok((m, _r, info)) => {
+                        println!(
+                            "[monitor] 分辨率/拓扑变化 → 重建捕获（{} {}x{}）",
+                            info.device_name, info.width, info.height
+                        );
+                        rebuild_capture(m, info, &mut capture_control, &tx, &backlog).await;
+                    }
+                    Err(e) => eprintln!("[monitor] 变化后目标解析失败: {e}"),
+                }
+                continue;
+            }
             _ = tokio::time::sleep_until(last_ping + std::time::Duration::from_secs(3)) => {
                 println!("主控端失联（3s 无 Ping），回收会话");
                 break;
@@ -527,10 +570,8 @@ async fn serve_session_inner(
                 }
             }
             Ok(Some(Message::Control(ControlMsg::MonitorSelect { index }))) => {
-                // M4-T2：会话内热切屏——停旧捕获 → 收回编码器（尺寸匹配则复用）
-                // → 同通道起新捕获（new() 内更新 ACTIVE 并先下发新尺寸 Info）→ nudge 逼首帧。
-                // 视频流只短暂断供（百毫秒级），会话/控制流不断。
-                let (_m, _rect, ninfo) = match crate::monitors::resolve_capture_target(Some(index)) {
+                // M4-T2：会话内热切屏（与分辨率重建共用 rebuild_capture）
+                let (m, _rect, ninfo) = match crate::monitors::resolve_capture_target(Some(index)) {
                     Ok(x) => x,
                     Err(e) => {
                         eprintln!("[monitor] 目标解析失败: {e}");
@@ -541,35 +582,7 @@ async fn serve_session_inner(
                     "[monitor] 切换捕获屏 → {}（{}x{}）",
                     ninfo.device_name, ninfo.width, ninfo.height
                 );
-                let Some(old_cc) = capture_control.take() else { continue };
-                let handler = old_cc.callback();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    tokio::task::spawn_blocking(move || old_cc.stop()),
-                )
-                .await;
-                let mut reuse: Option<SendEncoder> = None;
-                if let Some(mut h) = handler.try_lock() {
-                    if let Some(mut e) = h.enc.take() {
-                        if h.w == ninfo.width && h.h == ninfo.height {
-                            e.0.force_key();
-                            reuse = Some(e);
-                        }
-                    }
-                }
-                let (rtx, rrx) = std::sync::mpsc::channel::<()>();
-                capture_control = Some(start_capture(
-                    tx.clone(),
-                    rtx,
-                    backlog.clone(),
-                    reuse,
-                    Some(index),
-                ));
-                let _ = tokio::task::spawn_blocking(move || {
-                    rrx.recv_timeout(std::time::Duration::from_secs(3))
-                })
-                .await;
-                nudge_cursor();
+                rebuild_capture(m, ninfo, &mut capture_control, &tx, &backlog).await;
             }
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -590,6 +603,7 @@ async fn serve_session_inner(
     drop(tx);
     drop(control_send);
     drop(control_recv);
+    let _ = resmon_stop_tx.send(true); // M4-T2.4：停分辨率监视任务
     // 回收并行化（M2-1c）：被强杀的 client 会让 input 流读挂到超时——stop/video/input
     // 三步串行最坏 900ms，并行后封顶 300ms（抢占路径上新主控端少等一半）；
     // 编码器收回在 stop 完成后经 callback() try_lock 直取（尺寸取 handler 实时值
@@ -943,16 +957,15 @@ fn nudge_cursor() {
 }
 
 /// 启动捕获（自由线程）：返回外部控制句柄，会话结束用 `stop()` 主动回收。
-/// M4-T2：prefer 指定捕获屏（resolve_capture_target 内含主屏回退）。
+/// M4-T2：目标由调用方解析传入（下标选择/设备名重建共用）。
 fn start_capture(
     tx: mpsc::Sender<VideoItem>,
     ready: std::sync::mpsc::Sender<()>,
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     enc: Option<SendEncoder>,
-    prefer: Option<u32>,
+    monitor: windows_capture::monitor::Monitor,
+    info: rdlink_proto::MonitorInfo,
 ) -> ServeCaptureControl {
-    let (monitor, _rect, info) =
-        crate::monitors::resolve_capture_target(prefer).expect("捕获目标解析失败");
     let launch = Instant::now(); // M2-1a：捕获线程启动计时原点
     let boot = CaptureBoot { tx, ready, backlog, launch, enc, info };
     let settings = Settings::new(
@@ -966,4 +979,47 @@ fn start_capture(
         boot,
     );
     ServeCapture::start_free_threaded(settings).expect("捕获启动失败")
+}
+
+/// 会话内重建捕获（M4-T2：切屏与分辨率变化共用路径）。
+/// stop 旧捕获 → 收回编码器（尺寸匹配则复用）→ 同通道起新捕获
+/// （new() 内更新 ACTIVE 并先下发新尺寸 Info）→ 等 ready → nudge 逼首帧。
+/// 视频流只短暂断供（百毫秒级），会话/控制流不断。
+async fn rebuild_capture(
+    monitor: windows_capture::monitor::Monitor,
+    info: rdlink_proto::MonitorInfo,
+    capture_control: &mut Option<ServeCaptureControl>,
+    tx: &mpsc::Sender<VideoItem>,
+    backlog: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let Some(old_cc) = capture_control.take() else { return };
+    let handler = old_cc.callback();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tokio::task::spawn_blocking(move || old_cc.stop()),
+    )
+    .await;
+    let mut reuse: Option<SendEncoder> = None;
+    if let Some(mut h) = handler.try_lock() {
+        if let Some(mut e) = h.enc.take() {
+            if h.w == info.width && h.h == info.height {
+                e.0.force_key();
+                reuse = Some(e);
+            }
+        }
+    }
+    let (rtx, rrx) = std::sync::mpsc::channel::<()>();
+    *capture_control = Some(start_capture(
+        tx.clone(),
+        rtx,
+        backlog.clone(),
+        reuse,
+        monitor,
+        info,
+    ));
+    let _ = tokio::task::spawn_blocking(move || {
+        rrx.recv_timeout(std::time::Duration::from_secs(3))
+    })
+    .await;
+    nudge_cursor();
 }
