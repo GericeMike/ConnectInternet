@@ -315,9 +315,15 @@ pub fn write_clipboard_image(w: u32, h: u32, rgba: &[u8]) -> windows::core::Resu
         dib.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
         dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
         dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-        // RGBA → BGRA（alpha 保留）
-        for px in rgba.chunks_exact(4) {
-            dib.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        // RGBA → BGRA，**行序倒排**：biHeight>0 = 底-up 布局，DIB 首行对应
+        // 图像最底行（BMP 自 OS/2 的约定）。PNG 解码出的 RGBA 是顶-down，不倒
+        // 排的话真实应用（画图/QQ/微信）粘贴出来上下颠倒（M3-6 遗留 bug，读
+        // 路径 dib_to_rgba 一直是对的，曾因回环自测两端同错而漏检）。
+        let row = w as usize * 4;
+        for y in (0..h as usize).rev() {
+            for px in rgba[y * row..(y + 1) * row].chunks_exact(4) {
+                dib.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
         }
 
         let mut opened = false;
